@@ -67,6 +67,30 @@ rl-student-ppo num_envs="4096" *args:
 rl-bank-replay *args:
     uv run python scripts/rl/replay_expert_bank.py --task Isaac-HiveBoard-Anymal-{{rl_tool}}-RL-Play-v0 {{args}}
 
+# BC baselines: record the expert bank in the RL task, arm command increment (BC-A), absolute (BC-B) or absolute_integrated (BC-C)
+bc-collect command="increment" *args:
+    uv run python scripts/imitation/collect_bank_demos.py --task Isaac-HiveBoard-Anymal-{{rl_tool}}-RL-v0 \
+        --command {{command}} {{args}}
+
+# Behaviour-clone the PPO student's actor from recorded bank demos (no simulation)
+bc-train dataset *args:
+    uv run python scripts/imitation/train_bank_bc.py --dataset {{dataset}} {{args}}
+
+# rl-eval for a BC checkpoint, with the arm command it was trained on
+bc-eval checkpoint *args:
+    uv run python scripts/rl/evaluate.py --task Isaac-HiveBoard-Anymal-{{rl_tool}}-RL-Play-v0 \
+        --agent rsl_rl_student_ppo_cfg_entry_point --checkpoint {{checkpoint}} {{args}} \
+        $(uv run python scripts/imitation/bc_overrides.py {{checkpoint}})
+
+# BC-A + PPO: the PPO student's training, starting from an increment BC checkpoint; the first
+# `warmup` iterations train only a fresh critic on the cloned actor's rollouts, then the actor starts at `lr`
+bc-ppo checkpoint num_envs="4096" warmup="100" lr="1e-5" *args:
+    uv run python scripts/imitation/bc_overrides.py --ppo {{checkpoint}}
+    uv run python scripts/rl/train.py --task Isaac-HiveBoard-Anymal-{{rl_tool}}-RL-v0 --num_envs {{num_envs}} \
+        --agent rsl_rl_student_ppo_cfg_entry_point --checkpoint {{checkpoint}} --run_name bc_init \
+        agent.algorithm.critic_warmup_updates={{warmup}} agent.algorithm.critic_warmup_learning_rate=5e-4 \
+        agent.algorithm.learning_rate={{lr}} agent.algorithm.freeze_actor_normalization=true {{args}}
+
 # Success rate / reliability / stage metrics of a teacher or student checkpoint
 rl-eval checkpoint *args:
     uv run python scripts/rl/evaluate.py --task Isaac-HiveBoard-Anymal-{{rl_tool}}-RL-Play-v0 --checkpoint {{checkpoint}} {{args}}

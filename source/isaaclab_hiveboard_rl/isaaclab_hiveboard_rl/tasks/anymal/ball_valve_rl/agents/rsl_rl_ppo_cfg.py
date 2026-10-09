@@ -7,7 +7,9 @@
 
 from isaaclab.utils.configclass import configclass
 
-from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg, RslRlRndCfg
+from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlRndCfg
+
+from .critic_warmup import CriticWarmupPpoAlgorithmCfg
 
 TEACHER_HIDDEN_DIMS = [512, 256, 128]
 
@@ -33,7 +35,8 @@ class AnymalBallValveTeacherPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         activation="elu",
         obs_normalization=True,
     )
-    algorithm = RslRlPpoAlgorithmCfg(
+    # Plain PPO; agent.algorithm.critic_warmup_updates=<n> first trains only the critic (BC fine-tuning).
+    algorithm = CriticWarmupPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,

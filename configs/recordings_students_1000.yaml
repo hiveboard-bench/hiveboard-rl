@@ -1,0 +1,22 @@
+defaults:
+  agent: rsl_rl_student_ppo_cfg_entry_point
+  publication: true
+  standard: true
+  video_length: 400
+  seed: 0
+  device: cuda:0
+  timeout: 900
+  crash_retries: 2
+examples:
+- name: ball-valve
+  task: Isaac-HiveBoard-Anymal-BallValve-RL-Play-v0
+  checkpoint: logs/rsl_rl/anymal_ball_valve_student_ppo/2026-10-06_13-33-43_students_1000_20261006/model_999.pt
+- name: small-valve
+  task: Isaac-HiveBoard-Anymal-SmallValve-RL-Play-v0
+  checkpoint: logs/rsl_rl/anymal_small_valve_student_ppo/2026-10-06_15-00-03_students_1000_20261006/model_999.pt
+- name: m30-thread
+  task: Isaac-HiveBoard-Anymal-M30Thread-RL-Play-v0
+  checkpoint: logs/rsl_rl/anymal_m30_thread_student_ppo/2026-10-06_16-28-22_students_1000_20261006/model_999.pt
+- name: circuit-breaker
+  task: Isaac-HiveBoard-Anymal-CircuitBreaker-RL-Play-v0
+  checkpoint: logs/rsl_rl/anymal_circuit_breaker_student_ppo/2026-10-06_18-03-14_students_1000_20261006/model_999.pt

@@ -24,6 +24,7 @@ import os
 import sys
 
 import isaaclab_hiveboard_rl  # noqa: F401  (registers the HiveBoard tasks)
+from wandb_checkpoints import best_latest_wandb_checkpoints
 
 from isaaclab_rl import run_train_cli
 
@@ -52,4 +53,5 @@ def ensure_wandb_run_id() -> None:
 
 if __name__ == "__main__":
     ensure_wandb_run_id()
-    sys.exit(run_train_cli(["--rl_library", "rsl_rl", *with_newton_default(sys.argv[1:])]) or 0)
+    with best_latest_wandb_checkpoints():
+        sys.exit(run_train_cli(["--rl_library", "rsl_rl", *with_newton_default(sys.argv[1:])]) or 0)

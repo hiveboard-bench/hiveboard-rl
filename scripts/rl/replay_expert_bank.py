@@ -48,33 +48,8 @@ if args.visualizer is None and not getattr(args, "visualizer_explicit", False) a
 sys.argv = [sys.argv[0], *hydra_args]
 
 
-def make_sequential_reset():
-    """``reset_from_expert_bank`` that draws the selected trajectories in order instead of at random."""
-    from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl.expert_bank import reset_from_expert_bank
-
-    class reset_from_expert_bank_in_order(reset_from_expert_bank):
-        def __init__(self, cfg, env):
-            super().__init__(cfg, env)
-            if args.indices:
-                order = [int(i) for i in args.indices.split(",") if i.strip()]
-                if bad := [i for i in order if not 0 <= i < self.bank.size]:
-                    raise SystemExit(f"Indices {bad} out of range; the bank has {self.bank.size} trajectories.")
-                self.order = torch.tensor(order, device=env.device)
-            else:
-                gen = torch.Generator().manual_seed(args.seed)
-                self.order = torch.randperm(self.bank.size, generator=gen).to(env.device)
-            self.cursor = 0
-
-        def __call__(self, env, env_ids, path, mid_start_prob=0.0, expert_task=None):
-            ids = torch.arange(env.num_envs, device=env.device) if env_ids is None else env_ids
-            picks = self.order[(self.cursor + torch.arange(len(ids), device=env.device)) % len(self.order)]
-            self.cursor += len(ids)
-            self.write_start_state(env, ids, picks)
-
-    return reset_from_expert_bank_in_order
-
-
 def main() -> None:
+    from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl import expert_bank
     from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl import mdp as rl_mdp
 
     task_env = importlib.import_module(gym.spec(args.task).kwargs["env_cfg_entry_point"].split(":")[0])
@@ -86,7 +61,10 @@ def main() -> None:
     reset_cfg = env_cfg.events.reset_from_bank
     if args.bank:
         reset_cfg.params["path"] = os.path.abspath(args.bank)
-    reset_cfg.func = make_sequential_reset()
+    reset_cfg.func = expert_bank.reset_from_expert_bank_in_order
+    reset_cfg.params["seed"] = args.seed
+    if args.indices:
+        reset_cfg.params["order"] = [int(i) for i in args.indices.split(",") if i.strip()]
     if "viser" in (args.visualizer or []):
         from isaaclab_visualizers.viser import ViserVisualizerCfg
 
@@ -104,23 +82,15 @@ def main() -> None:
         dev, n_envs = env.device, env.num_envs
         term = env.expert_bank_term
         raw = torch.load(reset_cfg.params["path"], map_location="cpu", weights_only=False)
-        arm_target = raw["arm_target"].float().to(dev)  # (N, T, 6)
-        gripper_cmd = raw["gripper_cmd"].float().to(dev)  # (N, T)
         t_open = raw["t_open"].float()
-        horizon = arm_target.shape[1]
-        arm = env.action_manager.get_term("arm_action")
-        scale = float(env.cfg.actions.arm_action.scale)
 
         env.reset()
         opened = torch.zeros(n_envs, dtype=torch.bool, device=dev)
         done_episodes = 0
         with torch.inference_mode():
             while True:
-                idx = term.index
-                t = env.episode_length_buf.clamp(max=horizon - 1)
-                delta = (arm_target[idx, t] - arm._target) / scale
-                action = torch.cat((delta.clamp(-1.0, 1.0), gripper_cmd[idx, t, None]), dim=-1)
-                prev_idx = idx.clone()
+                action = expert_bank.expert_action(env)
+                prev_idx = term.index.clone()
                 _, _, terminated, truncated, _ = env.step(action)
                 opened |= rl_mdp.valve_open_success(env, SUCCESS_TOLERANCE_RAD)
                 for e in (terminated | truncated).nonzero().flatten().tolist():

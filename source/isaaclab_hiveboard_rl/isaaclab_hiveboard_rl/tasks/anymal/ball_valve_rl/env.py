@@ -394,6 +394,8 @@ class RewardsCfg:
     # the arm is far from it; the fine one asks for precision.
     track_expert_coarse = RewTerm(func=expert_bank.track_expert_joints, weight=2.0, params={"std": 0.5})
     track_expert = RewTerm(func=expert_bank.track_expert_joints, weight=3.0, params={"std": 0.15})
+    # Opt-in ablation: enable with env.rewards.track_expert_velocity.weight=1.0.
+    track_expert_velocity = RewTerm(func=expert_bank.track_expert_velocity, weight=0.0, params={"std": 0.5})
     # Close the gripper when the expert does (teacher v10, rewarded on joints
     # only, reached the lever every time but never closed it in 600 iterations;
     # at weight 1.0, v13/v14 unlearned closing by iteration 300). Tracks the
@@ -406,8 +408,14 @@ class RewardsCfg:
     # rate command is fixed to the expert's speed to match; a bank with varied
     # speeds would let it vary again. The coarse kernel keeps a gradient when
     # the valve is far behind, where the 0.1 rad one is flat (teacher v17).
-    track_expert_valve = RewTerm(func=expert_bank.track_expert_valve, weight=6.0, params={"std": 0.1})
-    track_expert_valve_coarse = RewTerm(func=expert_bank.track_expert_valve, weight=5.0, params={"std": 0.5})
+    # Opt-in: pay only with both pads on the lever while the expert grips it, so
+    # pushing the lever open does not pay (enable gate_on_contact=true on both).
+    track_expert_valve = RewTerm(
+        func=expert_bank.track_expert_valve, weight=6.0, params={"std": 0.1, "gate_on_contact": False}
+    )
+    track_expert_valve_coarse = RewTerm(
+        func=expert_bank.track_expert_valve, weight=5.0, params={"std": 0.5, "gate_on_contact": False}
+    )
     # Strong enough that the raw actions are smooth themselves, not only after
     # the action filter: teacher v7 (-0.05, no magnitude term) dithered between
     # +-1 every step behind the filter (lag-1 autocorrelation -0.85), which the
@@ -450,6 +458,11 @@ class AnymalBallValveRLEnvCfg(ManagerBasedRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(dt=1 / 200, render_interval=10, physics=BallValveRLPhysicsCfg())  # type: ignore
 
     def __post_init__(self):
+        # TODO: Bring back BallValve's arm-target error bound (it stops stored drive error from snapping the
+        # arm when it lets go) with a larger value than the 0.1 rad it had, and have the expert bank move
+        # smoothly enough to stay inside it. At 0.1 rad only 59% of bank trajectories still opened the valve
+        # through the increment action (98% unbounded), which capped the BC baselines; it is off until then.
+        # Reproduce the old controller with env.actions.arm_action.max_position_error=0.1.
         # 20 Hz policy. The slowest commanded turn (0.25 rad/s) takes 6.3 s; the
         # expert's slowest reaches (a far start posture, a wrist flip, a slow
         # reach speed) take ~5 s, and 99% of its trajectories open by 12.5 s.

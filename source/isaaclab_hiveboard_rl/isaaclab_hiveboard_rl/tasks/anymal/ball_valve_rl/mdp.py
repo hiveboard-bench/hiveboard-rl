@@ -21,6 +21,7 @@ Two observation tiers are built from these terms:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -180,12 +181,17 @@ class IntegratedJointPositionAction(JointAction):
     does. The filter is part of the action, so the robot runs it too; without
     it the teacher alternated its increments every step and chattered the
     lever at 10 Hz.
+
+    ``cfg.command`` selects what the policy outputs (the behaviour-cloning
+    baselines compare them; see :data:`ARM_COMMANDS`).
     """
 
     cfg: IntegratedJointPositionActionCfg
 
     def __init__(self, cfg: IntegratedJointPositionActionCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
+        if cfg.command not in ARM_COMMANDS:
+            raise ValueError(f"Unknown arm command '{cfg.command}'; expected one of {ARM_COMMANDS}")
         self._offset = 0.0
         self._fresh = False
         self._filtered = torch.zeros(self.num_envs, self.action_dim, device=self.device)
@@ -193,8 +199,26 @@ class IntegratedJointPositionAction(JointAction):
         limits = self._asset.data.soft_joint_pos_limits.torch[:, self._joint_ids]
         self._lower = limits[..., 0].clone()
         self._upper = limits[..., 1].clone()
+        limit = cfg.max_position_error
+        if limit is not None and (not math.isfinite(limit) or limit <= 0):
+            raise ValueError("max_position_error must be finite and positive, or None")
+
+    def increment_toward(self, target: torch.Tensor) -> torch.Tensor:
+        """The unit action (clipped to +-1, as PPO executes it) moving the integrated target toward ``target``."""
+        return ((target - self._target) / self.cfg.scale).clamp(-1.0, 1.0)
+
+    def measured(self) -> torch.Tensor:
+        """Measured positions of the arm joints [rad], the anchor of the ``relative`` commands."""
+        return self._asset.data.joint_pos.torch[:, self._joint_ids]
 
     def apply_actions(self):
+        if self.cfg.command in ("absolute", "relative"):
+            # Plain joint-position control, as the scripted expert's task runs it.
+            if self._fresh:
+                torch.clamp(self.processed_actions, self._lower, self._upper, out=self._target)
+                self._fresh = False
+            self._asset.set_joint_position_target_index(target=self._target, joint_ids=self._joint_ids)
+            return
         # Newton runs the decimation loop itself, so this is called once per
         # env step there and once per physics step on PhysX. Integrate only on
         # a fresh action so both backends see the same per-step increment.
@@ -202,12 +226,25 @@ class IntegratedJointPositionAction(JointAction):
             alpha = self.cfg.smoothing
             self._filtered.mul_(1.0 - alpha).add_(self.processed_actions, alpha=alpha)
             self._target += self._filtered
+            # Store the bounded target itself: clipping only the drive's output
+            # would leave a hidden integrator winding up against contact.
+            if self.cfg.max_position_error is not None:
+                measured = self._asset.data.joint_pos.torch[:, self._joint_ids]
+                limit = self.cfg.max_position_error
+                torch.clamp(self._target, measured - limit, measured + limit, out=self._target)
             torch.clamp(self._target, self._lower, self._upper, out=self._target)
             self._fresh = False
         self._asset.set_joint_position_target_index(target=self._target, joint_ids=self._joint_ids)
 
     def process_actions(self, actions: torch.Tensor):
         super().process_actions(actions)
+        target = self._raw_actions
+        if self.cfg.command.startswith("relative"):
+            target = target + self.measured()
+        if self.cfg.command in ("absolute", "relative"):
+            self._processed_actions = target.clone()
+        elif self.cfg.command in ("absolute_integrated", "relative_integrated"):
+            self._processed_actions = self.increment_toward(target) * self.cfg.scale
         self._fresh = True
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
@@ -230,6 +267,32 @@ class IntegratedJointPositionActionCfg(JointActionCfg):
     class_type: type = IntegratedJointPositionAction
     smoothing: float = 1.0
     """Weight of the new action in the low-pass filter; 1.0 disables filtering."""
+    max_position_error: float | None = None
+    """Maximum integrated target error per joint [rad]; None keeps unbounded integration.
+
+    Some error is needed to generate drive torque under load. The limit must
+    be chosen against the task's required torque and validated in simulation.
+    """
+    command: str = "increment"
+    """What the policy outputs, one of :data:`ARM_COMMANDS`; ``smoothing`` and ``max_position_error`` apply
+    to the integrating ones only."""
+
+
+ARM_COMMANDS = ("increment", "absolute_integrated", "absolute", "relative_integrated", "relative")
+"""Arm command of :class:`IntegratedJointPositionAction`:
+
+* ``increment``: target increments in units of ``scale``, the PPO policies' action (clip it to +-1).
+* ``absolute_integrated``: absolute joint targets [rad], each turned into the clipped increment toward
+  it, so the robot runs the same integrator, error bound and speed limit as ``increment``.
+* ``absolute``: absolute joint targets [rad] sent straight to the drives, the scripted expert's
+  joint-position control (no integrator, error bound or speed limit).
+* ``relative_integrated`` / ``relative``: as the absolute ones, with the target given relative to the
+  measured joint positions at the step (target = measured + action). The same targets, so the
+  expert replays identically, but a policy must output the motion itself: cloned from absolute
+  targets, it copies the measured joints (they are most of the target) and drifts in closed loop.
+
+Select with ``env.actions.arm_action.command=<name>``; all but ``increment`` need ``agent.clip_actions=null``.
+"""
 
 
 def silence_solver_overflow_warnings(env: ManagerBasedEnv, env_ids: torch.Tensor | None) -> None:

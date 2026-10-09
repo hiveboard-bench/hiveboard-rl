@@ -12,7 +12,8 @@ defaults:
 examples:
   - name: ball-valve
     task: Isaac-HiveBoard-Anymal-BallValve-RL-Play-v0
-    checkpoint: logs/rsl_rl/anymal_ball_valve_student_ppo/2026-10-01_15-57-28_student_ppo_v10_noflip/model_600.pt
+    checkpoint: logs/rsl_rl/anymal_ball_valve_student_ppo/2026-10-07_01-17-33_ballvalve_release_cap010_only_from999_50it_seed0/model_1048.pt
+    args: ["env.actions.arm_action.max_position_error=0.1"]  # Trained with the 0.1 rad cap, now off by default.
   - name: m30-thread
     task: Isaac-HiveBoard-Anymal-M30Thread-RL-Play-v0
     checkpoint: logs/rsl_rl/anymal_m30_thread_student_ppo/2026-10-02_08-33-09_student_ppo_v1/model_600.pt

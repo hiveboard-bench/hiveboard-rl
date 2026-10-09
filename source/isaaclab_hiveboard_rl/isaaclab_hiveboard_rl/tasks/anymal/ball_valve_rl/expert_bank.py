@@ -105,6 +105,10 @@ class ExpertBank:
         self.reach = torch.stack([torch.cat((p, p[-1:].expand(horizon - len(p), -1))) for p in paths])  # (N, H, 6)
         self.grasp_step = torch.tensor([len(p) - 1 for p in paths])
 
+        # The expert's own commands by time, for behaviour cloning (expert_action).
+        self.arm_target = target
+        self.gripper_cmd = bank["gripper_cmd"].float()
+
         # Turn and valve: the expert's measured joints and valve angle by time.
         # Episode steps past the reach's grasp map to the bank's own steps by
         # the idle steps the reach dropped.
@@ -140,6 +144,8 @@ class ExpertBank:
         for name in (
             "reach",
             "grasp_step",
+            "arm_target",
+            "gripper_cmd",
             "q",
             "valve",
             "gripper_q",
@@ -191,6 +197,26 @@ class ExpertBank:
     def turn_reference(self, idx: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
         """Expert measured joints at episode ``step``, ``(len(idx), 6)``."""
         return self.q[idx, self._bank_step(idx, step)]
+
+    def joint_reference(self, idx: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+        """Joint reference on the same idle-free reach and recorded turn timeline."""
+        reach = self.reach_reference(idx, step)
+        turn = self.turn_reference(idx, step)
+        return torch.where((step >= self.grasp_step[idx])[:, None], turn, reach)
+
+    def velocity_reference(self, idx: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+        """Central-difference reference velocity [rad/s], zero after the recording.
+
+        Differentiate the actual position-reward timeline, including removed
+        reach idle steps. At episode step zero use a forward difference.
+        """
+        previous = (step - 1).clamp(min=0)
+        following = step + 1
+        velocity = (self.joint_reference(idx, following) - self.joint_reference(idx, previous)) / (
+            (following - previous).float()[:, None] * self.dt
+        )
+        held = (step >= self.grasp_step[idx]) & (self._bank_step(idx, step) >= self.q.shape[1] - 1)
+        return torch.where(held[:, None], torch.zeros_like(velocity), velocity)
 
 
 class reset_from_expert_bank(ManagerTermBase):
@@ -249,8 +275,8 @@ class reset_from_expert_bank(ManagerTermBase):
             # Recording is evaluated from home, rather than a sampled expert start.
             self.index[ids] = 0
             self.start_step[ids] = 0
-            from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl.env import ARM_POSTURES
             from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl import mdp
+            from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl.env import ARM_POSTURES
 
             robot = env.scene["robot"]
             home = torch.tensor(ARM_POSTURES["home"], device=env.device).expand(len(ids), -1)
@@ -314,6 +340,44 @@ class reset_from_expert_bank(ManagerTermBase):
         pass
 
 
+class reset_from_expert_bank_in_order(reset_from_expert_bank):
+    """:class:`reset_from_expert_bank` drawing whole trajectories in a fixed order, cycling through it.
+
+    ``order`` (a param) lists the trajectory indices; by default it is a ``seed``-ed permutation of the
+    whole bank, so every trajectory is drawn once before any repeats. Episodes start at the beginning
+    of their trajectory (``mid_start_prob`` is ignored). Used to replay the bank and to record it.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        order = cfg.params.get("order")
+        if order is None:
+            gen = torch.Generator().manual_seed(int(cfg.params.get("seed", 0)))
+            order = torch.randperm(self.bank.size, generator=gen)
+        else:
+            order = torch.as_tensor(list(order), dtype=torch.long)
+            if bad := [int(i) for i in order if not 0 <= i < self.bank.size]:
+                raise ValueError(f"Trajectory indices {bad} out of range; the bank has {self.bank.size}.")
+        self.order = order.to(env.device)
+        self.cursor = 0
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor | None,
+        path: str,
+        mid_start_prob: float = 0.0,
+        expert_task: str | None = None,
+        standard: bool = False,
+        order: Sequence[int] | None = None,
+        seed: int = 0,
+    ) -> None:
+        ids = torch.arange(env.num_envs, device=env.device) if env_ids is None or isinstance(env_ids, slice) else env_ids
+        picks = self.order[(self.cursor + torch.arange(len(ids), device=env.device)) % len(self.order)]
+        self.cursor += len(ids)
+        self.write_start_state(env, ids, picks)
+
+
 def reference_step(env: ManagerBasedEnv) -> torch.Tensor:
     """Step along the expert trajectory: the episode step plus where the episode started on it."""
     term = _bank_term(env)
@@ -327,6 +391,30 @@ def _bank_term(env: ManagerBasedEnv) -> reset_from_expert_bank:
     return term
 
 
+def expert_action(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """The bank expert's action for the current step, in the arm action's command, ``(N, 7)``.
+
+    The expert's recorded joint targets and gripper command (-1 closes) by episode time, from where
+    the episode started on its trajectory, on the bank's own timeline (idle steps included: this is
+    what the expert sent, not the idle-free tracking reference). For the ``increment`` command the
+    target becomes the clipped increment from the arm's integrated target, so off the expert's path
+    it steers back toward the expert's target at this time; for the ``relative`` ones, the target
+    minus the measured joints, which the action adds back.
+    """
+    term = _bank_term(env)
+    bank = term.bank
+    step = (bank._bank_step(term.index, term.start_step) + env.episode_length_buf).clamp(
+        max=bank.arm_target.shape[1] - 1
+    )
+    target = bank.arm_target[term.index, step]
+    arm = env.action_manager.get_term("arm_action")
+    if arm.cfg.command == "increment":
+        target = arm.increment_toward(target)
+    elif arm.cfg.command.startswith("relative"):
+        target = target - arm.measured()
+    return torch.cat((target, bank.gripper_cmd[term.index, step, None]), dim=-1)
+
+
 def expert_joint_reference(env: ManagerBasedRLEnv, command_name: str = "valve_turn") -> torch.Tensor:
     """Expert arm-joint reference at the current episode time, ``(N, 6)`` [rad].
 
@@ -335,9 +423,7 @@ def expert_joint_reference(env: ManagerBasedRLEnv, command_name: str = "valve_tu
     """
     term = _bank_term(env)
     idx, step = term.index, reference_step(env)
-    reach = term.bank.reach_reference(idx, step)
-    turn = term.bank.turn_reference(idx, step)
-    return torch.where((step >= term.bank.grasp_step[idx])[:, None], turn, reach)
+    return term.bank.joint_reference(idx, step)
 
 
 def expert_joint_error(env: ManagerBasedRLEnv, command_name: str = "valve_turn") -> torch.Tensor:
@@ -353,6 +439,18 @@ def track_expert_joints(env: ManagerBasedRLEnv, std: float, command_name: str = 
     return torch.exp(-error.square().sum(dim=-1) / std**2)
 
 
+def track_expert_velocity(env: ManagerBasedRLEnv, std: float) -> torch.Tensor:
+    """Match measured arm velocity to the expert, using mean squared error.
+
+    ``std`` [rad/s] sets the per-joint RMS error scale. This rewards stopping
+    after retreat as well as matching the reach, turn and release speeds.
+    """
+    term = _bank_term(env)
+    reference = term.bank.velocity_reference(term.index, reference_step(env))
+    measured = env.scene["robot"].data.joint_vel.torch[:, term._arm_ids]
+    return torch.exp(-(measured - reference).square().mean(dim=-1) / std**2)
+
+
 def expert_valve_error(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Valve angle minus the expert's at the same episode time, ``(N, 1)`` [rad] (privileged observation)."""
     from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl import mdp
@@ -361,14 +459,29 @@ def expert_valve_error(env: ManagerBasedRLEnv) -> torch.Tensor:
     return (mdp.valve_angle(env) - term.bank.valve_reference(term.index, reference_step(env))).unsqueeze(-1)
 
 
-def track_expert_valve(env: ManagerBasedRLEnv, std: float) -> torch.Tensor:
+def track_expert_valve(env: ManagerBasedRLEnv, std: float, gate_on_contact: bool = False) -> torch.Tensor:
     """``exp(-(θ - θ_expert(t))^2 / std^2)``: the valve follows the expert's by episode time; ``std`` [rad].
 
     Before the expert grasps, this pays for leaving the valve where it is;
     after, for turning it on the expert's schedule; once the expert has
     opened, for keeping it open.
+
+    With ``gate_on_contact``, it pays while the expert grips the lever (both
+    pads in contact) only if both of the policy's pads press on it too (over
+    ``CONTACT_FORCE_N``). Ungated, BC-initialized PPO learned to push the lever
+    open: 87% of BallValve episodes opened it, 41% with a grasp. The gate reads
+    measured pad forces, not the TCP pose and gripper command that teacher
+    v19 met without gripping (see RewardsCfg).
     """
-    return torch.exp(-expert_valve_error(env)[:, 0].square() / std**2)
+    reward = torch.exp(-expert_valve_error(env)[:, 0].square() / std**2)
+    if not gate_on_contact:
+        return reward
+    from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl import mdp
+
+    term = _bank_term(env)
+    expert_grips = term.bank.contact_reference(term.index, reference_step(env)).min(dim=-1).values > 0
+    grips = (mdp.pad_valve_force(env) > CONTACT_FORCE_N).all(dim=-1)
+    return torch.where(expert_grips & ~grips, torch.zeros_like(reward), reward)
 
 
 def reset_from_expert_bank_cfg(path: str, mid_start_prob: float = 0.0, expert_task: str | None = None) -> EventTermCfg:

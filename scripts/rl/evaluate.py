@@ -239,6 +239,13 @@ def main() -> None:
                 "joint_acc_sq": zeros6(),
                 "joint_reversals": zeros6(),
                 "joint_steps": torch.zeros(n_envs, device=dev),
+                # Motion after opening while commanded to release. The older
+                # joint metrics stop at success and cannot see a release snap.
+                "release_steps": torch.zeros(n_envs, device=dev),
+                "release_peak_speed": torch.zeros(n_envs, device=dev),
+                "release_acc_sq": torch.zeros(n_envs, device=dev),
+                "release_velocity_err_sq": torch.zeros(n_envs, device=dev),
+                "prev_measured_v": zeros6(),
                 "prev_q": robot.data.joint_pos.torch[:, arm_ids].clone(),
                 "prev_v": zeros6(),
                 # Which bank trajectory the episode started from, and the wrist
@@ -294,6 +301,23 @@ def main() -> None:
                 if bank_term is not None:
                     stats["joint_err_sq"] += expert_bank.expert_joint_error(uenv).square() * active
                 stats["joint_steps"] += active[:, 0]
+                measured_v = robot.data.joint_vel.torch[:, arm_ids]
+                releasing = stats["success"] & (gripper_action.raw_actions[:, 0] > 0) & (step_count >= 2)
+                stats["release_steps"] += releasing.float()
+                stats["release_peak_speed"] = torch.maximum(
+                    stats["release_peak_speed"], measured_v.abs().amax(dim=-1) * releasing
+                )
+                stats["release_acc_sq"] += (
+                    ((measured_v - stats["prev_measured_v"]) / dt).square().mean(dim=-1) * releasing
+                )
+                if bank_term is not None:
+                    velocity_reference = bank_term.bank.velocity_reference(
+                        bank_term.index, expert_bank.reference_step(uenv)
+                    )
+                    stats["release_velocity_err_sq"] += (
+                        (measured_v - velocity_reference).square().mean(dim=-1) * releasing
+                    )
+                stats["prev_measured_v"] = measured_v.clone()
                 stats["prev_q"] = q.clone()
                 stats["prev_v"] = v.clone()
                 speed = torch.norm(robot.data.body_lin_vel_w.torch[:, gripper_body], dim=-1)
@@ -374,6 +398,14 @@ def main() -> None:
                             "joint_err_sq": stats["joint_err_sq"][i].tolist(),
                             "joint_acc_sq": stats["joint_acc_sq"][i].tolist(),
                             "joint_reversals": stats["joint_reversals"][i].tolist(),
+                            "release_steps": float(stats["release_steps"][i]),
+                            "release_peak_joint_speed_rad_s": float(stats["release_peak_speed"][i]),
+                            "release_rms_acceleration_rad_s2": float(
+                                (stats["release_acc_sq"][i] / stats["release_steps"][i]).sqrt()
+                            ) if stats["release_steps"][i] > 0 else float("nan"),
+                            "release_rms_velocity_error_rad_s": float(
+                                (stats["release_velocity_err_sq"][i] / stats["release_steps"][i]).sqrt()
+                            ) if bank_term is not None and stats["release_steps"][i] > 0 else float("nan"),
                             "length_s": float(step_count[i] * dt),
                             "bank_index": int(stats["bank_index"][i]),
                             "grasp_wrist_flexion": float(stats["grasp_wrist"][i]),
@@ -428,6 +460,14 @@ def main() -> None:
         "mean_achieved_rate_rad_s": _nanmean([e["achieved_rate_rad_s"] for e in episodes]),
         "invalid_episodes": sum(e["invalid"] for e in episodes),
         "per_joint": per_joint,
+        "release_motion": {
+            "episodes_with_samples": sum(e["release_steps"] > 0 for e in episodes),
+            "mean_peak_joint_speed_rad_s": _nanmean([
+                e["release_peak_joint_speed_rad_s"] for e in episodes if e["release_steps"] > 0
+            ]),
+            "mean_rms_acceleration_rad_s2": _nanmean([e["release_rms_acceleration_rad_s2"] for e in episodes]),
+            "mean_rms_velocity_error_rad_s": _nanmean([e["release_rms_velocity_error_rad_s"] for e in episodes]),
+        },
         "per_episode": episodes,
     }
     if args.video:
