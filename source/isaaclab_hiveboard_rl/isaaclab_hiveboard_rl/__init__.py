@@ -158,3 +158,18 @@ gym.register(
         **_ANYMAL_CIRCUIT_BREAKER_RL_AGENTS,
     },
 )
+
+_FRANKA_BALL_VALVE_AGENT = (
+    "isaaclab_hiveboard_rl.tasks.franka.ball_valve_rl.agents.rsl_rl_ppo_cfg:FrankaBallValveStudentPPORunnerCfg"
+)
+for _suffix, _cfg in (("RL-v0", "FrankaBallValveRLEnvCfg"), ("RL-Play-v0", "FrankaBallValveRLEnvCfg_PLAY")):
+    gym.register(
+        id=f"Isaac-HiveBoard-Franka-BallValve-{_suffix}",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv", disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"isaaclab_hiveboard_rl.tasks.franka.ball_valve_rl.env:{_cfg}",
+            "default_agent": "rsl_rl",
+            "rsl_rl_cfg_entry_point": _FRANKA_BALL_VALVE_AGENT,
+            "rsl_rl_student_ppo_cfg_entry_point": _FRANKA_BALL_VALVE_AGENT,
+        },
+    )

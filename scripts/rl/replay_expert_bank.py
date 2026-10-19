@@ -22,6 +22,7 @@ time to open recorded in the bank.
 
 import argparse
 import importlib
+import json
 import os
 import sys
 
@@ -39,6 +40,8 @@ parser.add_argument("--bank", default=None, help="Bank .pt file (default: the RL
 parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--indices", default=None, help="Comma-separated trajectory indices (default: random).")
 parser.add_argument("--episodes", type=int, default=None, help="Stop after this many episodes (default: run forever).")
+parser.add_argument("--command", choices=("increment", "absolute"), default="increment")
+parser.add_argument("--output", help="Write replay episode metrics as JSON.")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--viser_port", type=int, default=9080)
 add_launcher_args(parser)
@@ -58,6 +61,11 @@ def main() -> None:
     env_cfg, _ = resolve_task_config(args.task, "")
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.seed = args.seed
+    env_cfg.actions.arm_action.command = args.command
+    for name in ("arm_delay", "target_delay"):
+        delay = getattr(env_cfg.events, name, None)
+        if delay is not None:
+            delay.params["delay_range_s"] = (0.0, 0.0)
     reset_cfg = env_cfg.events.reset_from_bank
     if args.bank:
         reset_cfg.params["path"] = os.path.abspath(args.bank)
@@ -86,13 +94,23 @@ def main() -> None:
 
         env.reset()
         opened = torch.zeros(n_envs, dtype=torch.bool, device=dev)
+        held_once = torch.zeros_like(opened)
+        credited = torch.zeros_like(opened)
+        clear = torch.zeros_like(opened)
+        episodes = []
         done_episodes = 0
         with torch.inference_mode():
             while True:
+                # Sample before stepping: env.step autoresets completed episodes.
+                held = rl_mdp.lever_held(env, **task_env.HOLD)
+                held_once |= held
+                now_open = rl_mdp.valve_open_success(env, SUCCESS_TOLERANCE_RAD)
+                opened |= now_open
+                credited |= now_open & rl_mdp.opening_credited(env, held, held_once)
+                clear = rl_mdp.released_and_clear(env, SUCCESS_TOLERANCE_RAD)
                 action = expert_bank.expert_action(env)
                 prev_idx = term.index.clone()
                 _, _, terminated, truncated, _ = env.step(action)
-                opened |= rl_mdp.valve_open_success(env, SUCCESS_TOLERANCE_RAD)
                 for e in (terminated | truncated).nonzero().flatten().tolist():
                     i = int(prev_idx[e])
                     print(
@@ -100,10 +118,22 @@ def main() -> None:
                         f"{'opened' if opened[e] else 'NOT opened'} (bank opened at {t_open[i]:.2f}s)",
                         flush=True,
                     )
-                    opened[e] = False
+                    if args.episodes is None or done_episodes < args.episodes:
+                        episodes.append({"trajectory": i, "opened": bool(opened[e]),
+                                         "opened_held": bool(credited[e]), "complete": bool(credited[e] & clear[e])})
+                    opened[e] = held_once[e] = credited[e] = False
                     done_episodes += 1
                 if args.episodes is not None and done_episodes >= args.episodes:
                     break
+        if episodes:
+            summary = {key: sum(e[key] for e in episodes) / len(episodes)
+                       for key in ("opened", "opened_held", "complete")}
+            print(f"[REPLAY] {len(episodes)} episodes: {summary}", flush=True)
+            if args.output:
+                os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+                with open(args.output, "w") as f:
+                    json.dump({"task": args.task, "command": args.command, "summary": summary,
+                               "episodes": episodes}, f, indent=2)
         env.close()
 
 

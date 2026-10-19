@@ -4,7 +4,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Evaluate an RSL-RL teacher or student checkpoint on an ANYmal RL valve task (``--task``).
+"""Evaluate an RSL-RL teacher or student checkpoint on a HiveBoard RL valve task (``--task``).
 
 Runs ``--episodes`` full episodes, spread over ``--num_envs`` parallel
 environments, and reports the metrics the benchmark papers use (NIST task
@@ -59,6 +59,7 @@ parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.R
 parser.add_argument("--task", default="Isaac-HiveBoard-Anymal-BallValve-RL-Play-v0")
 parser.add_argument("--agent", default="rsl_rl_cfg_entry_point", help="Agent entry point of the checkpoint.")
 parser.add_argument("--checkpoint", required=True, help="RSL-RL model_*.pt checkpoint.")
+parser.add_argument("--export", action="store_true", help="Also export the loaded actor as TorchScript and ONNX.")
 parser.add_argument("--episodes", type=int, default=100)
 parser.add_argument("--num_envs", type=int, default=50)
 parser.add_argument("--seed", type=int, default=0)
@@ -147,11 +148,14 @@ def bank_joint_stats(path: str, dt: float) -> dict[str, torch.Tensor]:
     }
 
 
-def joint_table(episodes: list[dict], dt: float, expert: dict[str, torch.Tensor] | None) -> dict[str, dict]:
+def joint_table(
+    episodes: list[dict], dt: float, expert: dict[str, torch.Tensor] | None,
+    joint_names=ANYMAL_ARM_JOINT_NAMES,
+) -> dict[str, dict]:
     """Aggregate per-joint metrics over episodes, next to the expert baseline."""
     steps = sum(e["joint_steps"] for e in episodes)
     table = {}
-    for j, name in enumerate(ANYMAL_ARM_JOINT_NAMES):
+    for j, name in enumerate(joint_names):
         err = sum(e["joint_err_sq"][j] for e in episodes)
         acc = sum(e["joint_acc_sq"][j] for e in episodes)
         rev = sum(e["joint_reversals"][j] for e in episodes)
@@ -191,6 +195,10 @@ def main() -> None:
         env = RslRlVecEnvWrapper(base_env, clip_actions=agent_cfg.clip_actions)
         runner = create_rsl_rl_runner(env, agent_cfg)
         runner.load(os.path.abspath(args.checkpoint))
+        if args.export:
+            export_dir = os.path.join(os.path.dirname(os.path.abspath(args.checkpoint)), "exported")
+            runner.export_policy_to_jit(path=export_dir, filename="policy.pt")
+            runner.export_policy_to_onnx(path=export_dir, filename="policy.onnx")
         policy = runner.get_inference_policy(device=env.unwrapped.device)
 
         from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl import mdp
@@ -203,13 +211,16 @@ def main() -> None:
         grasp = task_env.HOLD
         turn = uenv.command_manager.get_term("valve_turn")
         robot = uenv.scene["robot"]
-        gripper_body = robot.find_bodies("robotiq_base_link")[0][0]
-        arm_ids = robot.find_joints(list(ANYMAL_ARM_JOINT_NAMES), preserve_order=True)[0]
+        from isaaclab_hiveboard_rl.tasks.robot import robot_cfg
+
+        profile = robot_cfg(uenv)
+        gripper_body = robot.find_bodies(profile.tcp_body)[0][0]
+        arm_ids = robot.find_joints(list(profile.arm_joint_names), preserve_order=True)[0]
         finger_ids = robot.find_joints(uenv.cfg.actions.gripper_action.joint_names)[0]
         gripper_action = uenv.action_manager.get_term("gripper_action")
         bank_term = getattr(uenv, "expert_bank_term", None)
-        wrist_col = list(ANYMAL_ARM_JOINT_NAMES).index("dynaarm_wrist_flexion")
-        zeros6 = lambda: torch.zeros(n_envs, 6, device=dev)  # noqa: E731
+        wrist_col = list(profile.arm_joint_names).index(profile.diagnostic_joint)
+        zeros_arm = lambda: torch.zeros(n_envs, len(arm_ids), device=dev)  # noqa: E731
 
         def fresh() -> dict[str, torch.Tensor]:
             return {
@@ -235,9 +246,9 @@ def main() -> None:
                 "turn_steps": torch.zeros(n_envs, device=dev),
                 "commanded_rate": turn.rate.clone(),
                 # Per-joint smoothness and expert tracking, until open-while-held.
-                "joint_err_sq": zeros6(),
-                "joint_acc_sq": zeros6(),
-                "joint_reversals": zeros6(),
+                "joint_err_sq": zeros_arm(),
+                "joint_acc_sq": zeros_arm(),
+                "joint_reversals": zeros_arm(),
                 "joint_steps": torch.zeros(n_envs, device=dev),
                 # Motion after opening while commanded to release. The older
                 # joint metrics stop at success and cannot see a release snap.
@@ -245,9 +256,9 @@ def main() -> None:
                 "release_peak_speed": torch.zeros(n_envs, device=dev),
                 "release_acc_sq": torch.zeros(n_envs, device=dev),
                 "release_velocity_err_sq": torch.zeros(n_envs, device=dev),
-                "prev_measured_v": zeros6(),
+                "prev_measured_v": zeros_arm(),
                 "prev_q": robot.data.joint_pos.torch[:, arm_ids].clone(),
-                "prev_v": zeros6(),
+                "prev_v": zeros_arm(),
                 # Which bank trajectory the episode started from, and the wrist
                 # flexion at the first held step (its sign is the IK branch).
                 "bank_index": bank_term.index.clone() if bank_term is not None else torch.zeros(n_envs, device=dev),
@@ -422,13 +433,15 @@ def main() -> None:
 
     n = len(episodes)
     successes = sum(e["success"] for e in episodes)
-    per_joint = joint_table(episodes, dt, expert_bank_stats)
+    per_joint = joint_table(episodes, dt, expert_bank_stats, profile.arm_joint_names)
     times = [e["time_to_success_s"] for e in episodes if e["success"]]
     t_mean = sum(times) / len(times) if times else float("nan")
     t_std = math.sqrt(sum((t - t_mean) ** 2 for t in times) / (len(times) - 1)) if len(times) > 1 else float("nan")
     lo, hi = wilson_interval(successes, n)
     summary = {
         "task": args.task,
+        "robot": profile.name,
+        "diagnostic_joint": profile.diagnostic_joint,
         "agent": args.agent,
         "checkpoint": os.path.abspath(args.checkpoint),
         "hydra_overrides": hydra_args,

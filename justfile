@@ -22,7 +22,7 @@ list-envs:
 
 # CPU unit tests for the valve RL tasks
 test:
-    uv run --with pytest python -m pytest scripts/test_valve_rl_tasks.py
+    uv run --with pytest python -m pytest scripts/test_valve_rl_tasks.py scripts/test_franka_rl_tasks.py
 
 # Collect scripted-expert demos for imitation learning (robomimic layout)
 il-collect num_demos="50" num_envs="8" *args:
@@ -42,10 +42,11 @@ il-eval *args:
 
 # Part of the rl-* recipes: BallValve (default), SmallValve, M30Thread or CircuitBreaker, e.g. `RL_TOOL=SmallValve just rl-teacher`
 rl_tool := env("RL_TOOL", "BallValve")
+rl_robot := env("RL_ROBOT", "Anymal")
 
 # Build the cuRobo expert bank the RL task resets from and tracks
 rl-bank num_envs="512" num_trajectories="5000" *args:
-    uv run python scripts/rl/build_expert_bank.py --task Isaac-HiveBoard-Anymal-{{rl_tool}}-RL-v0 \
+    uv run python scripts/rl/build_expert_bank.py --task Isaac-HiveBoard-{{rl_robot}}-{{rl_tool}}-RL-v0 \
         --num_envs {{num_envs}} --num_trajectories {{num_trajectories}} {{args}}
 
 # RL teacher: PPO on privileged state (ANYmal ball valve by default)
@@ -60,12 +61,12 @@ rl-student teacher num_envs="4096" *args:
 
 # RL student trained directly with PPO: deployable actor, privileged critic
 rl-student-ppo num_envs="4096" *args:
-    uv run python scripts/rl/train.py --task Isaac-HiveBoard-Anymal-{{rl_tool}}-RL-v0 --num_envs {{num_envs}} \
+    uv run python scripts/rl/train.py --task Isaac-HiveBoard-{{rl_robot}}-{{rl_tool}}-RL-v0 --num_envs {{num_envs}} \
         --agent rsl_rl_student_ppo_cfg_entry_point {{args}}
 
 # Replay expert-bank trajectories in simulation, shown in Viser (http://localhost:9080)
 rl-bank-replay *args:
-    uv run python scripts/rl/replay_expert_bank.py --task Isaac-HiveBoard-Anymal-{{rl_tool}}-RL-Play-v0 {{args}}
+    uv run python scripts/rl/replay_expert_bank.py --task Isaac-HiveBoard-{{rl_robot}}-{{rl_tool}}-RL-Play-v0 {{args}}
 
 # BC baselines: record the expert bank in the RL task, arm command increment (BC-A), absolute (BC-B) or absolute_integrated (BC-C)
 bc-collect command="increment" *args:
@@ -93,20 +94,20 @@ bc-ppo checkpoint num_envs="4096" warmup="100" lr="1e-5" *args:
 
 # Success rate / reliability / stage metrics of a teacher or student checkpoint
 rl-eval checkpoint *args:
-    uv run python scripts/rl/evaluate.py --task Isaac-HiveBoard-Anymal-{{rl_tool}}-RL-Play-v0 --checkpoint {{checkpoint}} {{args}}
+    uv run python scripts/rl/evaluate.py --task Isaac-HiveBoard-{{rl_robot}}-{{rl_tool}}-RL-Play-v0 --checkpoint {{checkpoint}} {{args}}
 
 # Watch a checkpoint in the Newton viewer and export it (TorchScript + ONNX)
 rl-play checkpoint *args:
-    uv run python scripts/rl/play.py --task Isaac-HiveBoard-Anymal-{{rl_tool}}-RL-Play-v0 --checkpoint {{checkpoint}} --viz newton {{args}}
+    uv run python scripts/rl/play.py --task Isaac-HiveBoard-{{rl_robot}}-{{rl_tool}}-RL-Play-v0 --checkpoint {{checkpoint}} --viz newton {{args}}
 
 # Record one 12 s episode of a checkpoint to <run>/videos/play/ (student: --agent rsl_rl_distillation_cfg_entry_point)
 rl-video checkpoint *args:
-    uv run python scripts/rl/play.py --task Isaac-HiveBoard-Anymal-{{rl_tool}}-RL-Play-v0 --checkpoint {{checkpoint}} \
+    uv run python scripts/rl/play.py --task Isaac-HiveBoard-{{rl_robot}}-{{rl_tool}}-RL-Play-v0 --checkpoint {{checkpoint}} \
         --num_envs 1 --video --video_length 240 --viz newton {{args}}
 
 # Record a checkpoint at 1080p with converged RTX, studio lighting and CRF 12 / slow encoding
 rl-video-publication checkpoint *args:
-    uv run python scripts/rl/play.py --task Isaac-HiveBoard-Anymal-{{rl_tool}}-RL-Play-v0 --checkpoint {{checkpoint}} \
+    uv run python scripts/rl/play.py --task Isaac-HiveBoard-{{rl_robot}}-{{rl_tool}}-RL-Play-v0 --checkpoint {{checkpoint}} \
         --num_envs 1 --video_length 240 --publication --stop-on-termination {{args}}
 
 # Record the first episode of every task/checkpoint in configs/recordings.yaml

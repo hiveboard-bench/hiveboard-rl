@@ -60,6 +60,7 @@ parser.add_argument(
 parser.add_argument("--max_waves", type=int, default=50)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--output", default=None, help="Default: logs/expert_bank/<the RL task's BANK_PREFIX>_bank.pt.")
+parser.add_argument("--cuda_graph", action="store_true", help="Capture Newton physics steps in a CUDA graph.")
 parser.add_argument("--nominal_valve", action="store_true", help="Fixed valve dynamics (no randomization).")
 parser.add_argument("--nominal_expert", action="store_true", help="The authored expert (no speed or grasp variation).")
 parser.add_argument("--nominal_pose", action="store_true", help="The previous, narrower valve placement range.")
@@ -100,11 +101,6 @@ RL_CFG_CLASS = getattr(rl_env, gym.spec(RL_TASK).kwargs["env_cfg_entry_point"].s
 TASK = rl_env.EXPERT_TASK
 args.task = TASK
 args.output = args.output or f"logs/expert_bank/{rl_env.BANK_PREFIX}_bank.pt"
-# Match the RL task's gripper ramp and its force-limited close (fingers
-# commanded past contact). A Hydra override survives the task parse; editing
-# the action cfg in place before gym.make does not.
-hydra_args.append("env.actions.gripper_action.close_speed=2.0")
-hydra_args.append(f"env.actions.gripper_action.close_command_expr.finger_joint={rl_env.GRIPPER_CLOSE_RAD}")
 args.visualizer = ["newton_gl"] if args.video else []
 sys.argv = [sys.argv[0], *hydra_args]
 
@@ -117,9 +113,10 @@ def configure(env_cfg) -> dict:
     from isaaclab.managers import EventTermCfg, SceneEntityCfg
     from isaaclab.managers.recorder_manager import RecorderManagerBaseCfg
 
-    from isaaclab_hiveboard.assets.anymal.bench import ANYMAL_ARM_JOINT_NAMES
-
     rl = RL_CFG_CLASS()
+    profile = rl.rl_robot
+    env_cfg.rl_robot = profile
+    env_cfg.actions.gripper_action = rl.actions.gripper_action.copy()
     # The RL terms used to score the expert find the valve here.
     env_cfg.valve_task = rl.valve_task
     valve_name = rl.valve_task.asset_name
@@ -132,26 +129,33 @@ def configure(env_cfg) -> dict:
     # The RL task's force-limited gripper and stiff gripper-valve contacts.
     # Its arm command latency is for the policy; the expert records without
     # (max_delay 0: no delay buffer).
-    robot = actuator_delay.delayed_actuators(
-        rl.scene.robot, actuator_delay.ARM_ACTUATOR_GROUPS, args.arm_delay_s, rl.sim.dt
-    )
+    robot = rl.scene.robot
+    if not profile.implicit:
+        robot = actuator_delay.delayed_actuators(robot, profile.actuator_groups, args.arm_delay_s, rl.sim.dt)
+    elif args.arm_delay_s:
+        raise ValueError("FR3 expert collection currently requires --arm_delay_s 0; train with target_delay instead")
     if args.arm_gain_scale != 1.0:
         actuators = dict(robot.actuators)
-        for name in actuator_delay.ARM_ACTUATOR_GROUPS:
+        for name in profile.actuator_groups:
             a = actuators[name]
             actuators[name] = a.replace(stiffness=a.stiffness * args.arm_gain_scale, damping=a.damping * args.arm_gain_scale)
         robot = robot.replace(actuators=actuators)
     env_cfg.scene.robot = robot
     if args.arm_delay_s > 0.0:
-        env_cfg.events.arm_delay = actuator_delay.randomize_actuator_delay_cfg((args.arm_delay_s, args.arm_delay_s))
+        env_cfg.events.arm_delay = actuator_delay.randomize_actuator_delay_cfg((args.arm_delay_s, args.arm_delay_s), profile.actuator_groups)
     env_cfg.events.gripper_valve_contacts = rl.events.gripper_valve_contacts
+    env_cfg.events.quiet_solver = rl.events.quiet_solver
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.seed = args.seed
+    env_cfg.sim.dt = rl.sim.dt
+    env_cfg.sim.render_interval = rl.decimation
     env_cfg.decimation = rl.decimation
     if args.episode_length_s is None:
         args.episode_length_s = rl.episode_length_s + 1.0
     env_cfg.episode_length_s = args.episode_length_s
     physics = env_cfg.sim.physics
+    if args.cuda_graph:
+        physics.use_cuda_graph = True
     if hasattr(physics, "solver_cfg"):
         # nconmax is per world; the scripted task's 4000 only fits a few envs.
         physics.solver_cfg.nconmax = rl.sim.physics.newton_mjwarp.solver_cfg.nconmax
@@ -225,7 +229,7 @@ def configure(env_cfg) -> dict:
         params={
             "postures": dict(ranges["arm_postures"]),
             "position_range": ranges["arm"],
-            "asset_cfg": SceneEntityCfg("robot", joint_names=list(ANYMAL_ARM_JOINT_NAMES), preserve_order=True),
+            "asset_cfg": SceneEntityCfg("robot", joint_names=list(profile.arm_joint_names), preserve_order=True),
             "flip_prob": ranges["arm_flip_prob"],
             "flip_joints": rl_env.ARM_WRIST_FLIP,
         },
@@ -245,7 +249,7 @@ def configure(env_cfg) -> dict:
     # wrist-flipped start keeps its flipped wrist.
     env_cfg.events.expert_diversity = expert_diversity.sample_expert_diversity_cfg(
         ranges["expert_diversity"],
-        wrist_branch_nearest=not args.no_wrist_flip,
+        wrist_branch_nearest=not args.no_wrist_flip and rl_env.ARM_WRIST_FLIP is not None,
         grasp_axes=rl_env.EXPERT_GRASP_AXES,
         overshoot=rl_env.EXPERT_OVERSHOOT,
     )
@@ -288,7 +292,7 @@ def configure(env_cfg) -> dict:
             command.duration_s = rl_env.EXPERT_GRIP_S
         if hasattr(command, "plan_batch_size"):
             command.plan_batch_size = batch
-        if hasattr(command, "wrist_flip_joints") and not args.no_wrist_flip:
+        if hasattr(command, "wrist_flip_joints") and not args.no_wrist_flip and rl_env.ARM_WRIST_FLIP is not None:
             command.wrist_flip_joints = expert_diversity.WRIST_FLIP_JOINTS
     # Task-specific changes to the expert, e.g. skipping a regrasp once the part is done.
     if hasattr(rl_env, "configure_expert"):
@@ -299,7 +303,6 @@ def configure(env_cfg) -> dict:
 def main() -> None:
     from isaaclab_hiveboard_rl.imitation.expert import ScriptedExpert
     from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl import mdp as rl_mdp
-    from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl.expert_bank import GRIPPER_LINKAGE_JOINTS
     from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl.expert_diversity import EXPERT_DIVERSITY
     from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl.valve_dynamics import VALVE_DYNAMICS
 
@@ -317,10 +320,10 @@ def main() -> None:
         robot, valve = env.scene["robot"], rl_mdp.valve_asset(env)
         arm_ids = robot.find_joints(env_cfg.actions.arm_action.joint_names, preserve_order=True)[0]
         grip_id = robot.find_joints(env_cfg.actions.gripper_action.joint_names)[0][0]
-        # The whole Robotiq linkage, so episodes can start mid-grasp (reset_from_expert_bank).
-        hand_ids, hand_names = robot.find_joints(GRIPPER_LINKAGE_JOINTS, preserve_order=True)
+        # All hand joints, so episodes can start mid-grasp (reset_from_expert_bank).
+        hand_ids, hand_names = robot.find_joints(list(env_cfg.rl_robot.hand_joint_names), preserve_order=True)
         command = env.command_manager.get_term("pose_command")
-        arm_ids_wrist = list(env_cfg.actions.arm_action.joint_names).index("dynaarm_wrist_flexion")
+        arm_ids_wrist = list(env_cfg.actions.arm_action.joint_names).index(env_cfg.rl_robot.diagnostic_joint)
         horizon = int(env.max_episode_length)
         kept: dict[str, list[torch.Tensor]] = {}
         # Every episode's sampled variation and outcome, for the success breakdown.
@@ -524,8 +527,14 @@ def main() -> None:
             )
             env.close()
             return
+        if stats["kept"] == 0:
+            raise RuntimeError("No successful expert trajectories; inspect grasp/contact diagnostics before training")
         bank = {key: torch.cat(values)[: args.num_trajectories] for key, values in kept.items()}
         bank["meta"] = {
+            "robot": env_cfg.rl_robot.name,
+            "diagnostic_joint": env_cfg.rl_robot.diagnostic_joint,
+            "physics_dt": env.physics_dt,
+            "seed": args.seed,
             "task": TASK,
             "rl_task": RL_TASK,
             "valve_task": env_cfg.valve_task.to_dict(),
@@ -587,26 +596,29 @@ def main() -> None:
         # Arm start posture (nearest one, ignoring the wrist flip), wrist
         # branch and stuck valves.
         arm_q0 = torch.cat(sampled["arm_q0"])
-        roll1, pitch, roll2 = rl_env.ARM_WRIST_FLIP
-        flipped = arm_q0[:, roll1].abs() > math.pi / 2
+        flipped = torch.zeros(len(arm_q0), dtype=torch.bool)
         unflipped = arm_q0.clone()
-        unflipped[flipped, roll1] -= torch.sign(unflipped[flipped, roll1]) * math.pi
-        unflipped[flipped, pitch] *= -1.0
-        unflipped[flipped, roll2] += math.pi
+        if rl_env.ARM_WRIST_FLIP is not None:
+            roll1, pitch, roll2 = rl_env.ARM_WRIST_FLIP
+            flipped = arm_q0[:, roll1].abs() > math.pi / 2
+            unflipped[flipped, roll1] -= torch.sign(unflipped[flipped, roll1]) * math.pi
+            unflipped[flipped, pitch] *= -1.0
+            unflipped[flipped, roll2] += math.pi
         postures = torch.tensor(list(ranges["arm_postures"].values()))
         nearest = torch.cdist(unflipped, postures).argmin(dim=1)
         for i, name in enumerate(ranges["arm_postures"]):
             sel = nearest == i
             print(f"[BANK] kept from posture {name:10s}: {ok_all[sel].mean():.1%} of {int(sel.sum())}", flush=True)
-        wrist = torch.cat(sampled["turn_wrist"])
-        for label, sel in (("usual start", ~flipped), ("flipped start", flipped)):
-            turned = sel & ~wrist.isnan()
-            on_flip = (wrist[turned] > 0).float().mean() if turned.any() else torch.tensor(float("nan"))
-            print(
-                f"[BANK] {label:13s}: kept {ok_all[sel].mean():.1%} of {int(sel.sum())}, "
-                f"turned with wrist flexion > 0 in {on_flip:.1%}",
-                flush=True,
-            )
+        if rl_env.ARM_WRIST_FLIP is not None:
+            wrist = torch.cat(sampled["turn_wrist"])
+            for label, sel in (("usual start", ~flipped), ("flipped start", flipped)):
+                turned = sel & ~wrist.isnan()
+                on_flip = (wrist[turned] > 0).float().mean() if turned.any() else torch.tensor(float("nan"))
+                print(
+                    f"[BANK] {label:13s}: kept {ok_all[sel].mean():.1%} of {int(sel.sum())}, "
+                    f"turned with wrist flexion > 0 in {on_flip:.1%}",
+                    flush=True,
+                )
         # Valve orientation offset (roll about the stem, pitch, yaw) from the nominal one.
         from isaaclab.utils import math as math_utils
 
