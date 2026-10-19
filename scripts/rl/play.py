@@ -32,7 +32,10 @@ def configure_standard(env_cfg):
     env_cfg.events.reset_from_bank.params.update(standard=True, mid_start_prob=0.0)
     env_cfg.events.robot_physics_material = None
     env_cfg.events.valve_physics_material = None
-    env_cfg.events.arm_delay.params["delay_range_s"] = (0.0, 0.0)
+    for name in ("arm_delay", "target_delay"):
+        term = getattr(env_cfg.events, name, None)
+        if term is not None:
+            term.params["delay_range_s"] = (0.0, 0.0)
     env_cfg.events.valve_dynamics.params.update(
         ranges={"friction": (0.05, 0.05), "damping": (0.0, 0.0), "spring": (0.0, 0.0),
                 "breakaway": (0.0, 0.0), "armature": (0.005, 0.005)},
@@ -129,7 +132,7 @@ def run_recording(argv: list[str], *, publication=False, stop_on_termination=Fal
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--standard", action="store_true")
     parser.add_argument("--publication", action="store_true")
     parser.add_argument("--stop-on-termination", action="store_true")

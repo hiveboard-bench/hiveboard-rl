@@ -26,6 +26,22 @@ from isaaclab_rl.entrypoints.backends import play_rsl_rl
 
 
 class RecordingTests(unittest.TestCase):
+    def test_video_flag_is_forwarded_without_abbreviating_video_output(self):
+        for output in (None, "logs/videos/franka"):
+            with self.subTest(output=output):
+                argv = ["--video", "--video_length", "240", "--agent", "rsl_rl_student_ppo_cfg_entry_point",
+                        "--video_length", "340", "--stop-on-termination"]
+                if output is not None:
+                    argv.extend(["--video-output", output])
+                with patch.object(play, "run_recording") as recording:
+                    play.main(argv)
+                forwarded = recording.call_args.args[0]
+                self.assertIn("--video", forwarded)
+                self.assertIn("340", forwarded)
+                self.assertNotIn("--video-output", forwarded)
+                self.assertTrue(recording.call_args.kwargs["stop_on_termination"])
+                self.assertEqual(recording.call_args.kwargs["output_dir"], output)
+
     def check_boundary(self, terminate_at):
         captures, steps = [], []
         reset = SimpleNamespace(any=lambda: len(steps) == terminate_at)
