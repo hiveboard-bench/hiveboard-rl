@@ -30,6 +30,33 @@ def _cfg(task: str):
     return importlib.import_module(module), getattr(importlib.import_module(module), name)()
 
 
+def test_panel_follows_rotated_valve_only_in_reset_environments():
+    from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl.mdp import reset_panel_from_valve
+
+    # Two translated bases, with identity and 90-degree yaw (xyzw).
+    pose = torch.tensor([[1., 2., 3., 0., 0., 0., 1.],
+                         [4., 5., 6., 0., 0., math.sqrt(0.5), math.sqrt(0.5)]])
+    writes = {}
+    panel = SimpleNamespace(
+        write_root_pose_to_sim_index=lambda **kw: writes.update(kw),
+        write_root_velocity_to_sim_index=lambda **kw: writes.update(kw),
+    )
+    env = SimpleNamespace(
+        cfg=SimpleNamespace(valve_task=SimpleNamespace(asset_name="ball_valve")),
+        scene={"ball_valve": SimpleNamespace(data=SimpleNamespace(root_link_pose_w=pose)), "honeycomb": panel},
+        num_envs=2, device="cpu",
+    )
+    reset_panel_from_valve(env, torch.tensor([1]))
+    torch.testing.assert_close(writes["root_pose"][:, :3], torch.tensor([[4., 4.96, 6.]]))
+    torch.testing.assert_close(writes["root_pose"][:, 3:], pose[1:, 3:])
+    assert writes["env_ids"].tolist() == [1]
+    assert not writes["root_velocity"].any()
+    reset_panel_from_valve(env, None)
+    torch.testing.assert_close(writes["root_pose"][0, :3], torch.tensor([0.96, 2., 3.]))
+    reset_panel_from_valve(env, slice(1, None))
+    assert writes["env_ids"].tolist() == [1]
+
+
 @pytest.mark.parametrize("task", list(_TASKS))
 @pytest.mark.parametrize("play", [False, True])
 def test_every_valve_reference_names_the_task_valve(task, play):

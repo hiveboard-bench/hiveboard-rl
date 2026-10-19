@@ -24,6 +24,7 @@ import os
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
 
 from isaaclab.assets.articulation import ArticulationCfg
+from isaaclab.assets import RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -56,6 +57,8 @@ from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl import (
     mdp,
     valve_dynamics,
 )
+
+from isaaclab_hiveboard_rl.tasks.robot import RobotCfg
 
 ARM = SceneEntityCfg("robot", joint_names=list(ANYMAL_ARM_JOINT_NAMES), preserve_order=True)
 GRIPPER = SceneEntityCfg("robot", joint_names=list(NEWTON_GRIPPER_JOINT_NAMES), preserve_order=True)
@@ -359,6 +362,8 @@ class EventCfg:
     # Half the episodes start mid-trajectory, e.g. already gripping and turning,
     # so gripping is experienced without having to be discovered first.
     reset_from_bank = expert_bank.reset_from_expert_bank_cfg(EXPERT_BANK_PATH, mid_start_prob=0.5, expert_task=EXPERT_TASK)
+    # Last: the bank (or uniform reset) has written the final valve base pose.
+    reset_panel = EventTerm(func=mdp.reset_panel_from_valve, mode="reset")
 
 
 @configclass
@@ -443,10 +448,27 @@ class TerminationsCfg:
 
 
 @configclass
+class BallValveRLSceneCfg(BallValveSceneCfg):
+    """A movable visual panel, synchronized with the valve by reset events."""
+
+    honeycomb = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Honeycomb",
+        spawn=BallValveSceneCfg().honeycomb.spawn.replace(
+            func=mdp.spawn_movable_panel,
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(1.04, 0.06, 0.804), rot=(0.0, 0.0, 1.0, 0.0)
+        ),
+        collision_group=-1,
+    )
+
+
+@configclass
 class AnymalBallValveRLEnvCfg(ManagerBasedRLEnvCfg):
     """ANYmal + DynaArm opens the HiveBoard ball valve (closed -> -90 deg) with RL."""
 
-    scene: BallValveSceneCfg = BallValveSceneCfg(num_envs=1024, env_spacing=3.0)  # type: ignore
+    rl_robot: RobotCfg = RobotCfg()
+    scene: BallValveRLSceneCfg = BallValveRLSceneCfg(num_envs=1024, env_spacing=3.0)  # type: ignore
     # The valve every RL term acts on (mdp.ValveTaskCfg; defaults are the ball valve's).
     valve_task: mdp.ValveTaskCfg = mdp.ValveTaskCfg()
     observations: ObservationsCfg = ObservationsCfg()

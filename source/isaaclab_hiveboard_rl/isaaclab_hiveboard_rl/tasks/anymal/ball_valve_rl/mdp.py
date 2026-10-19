@@ -32,8 +32,11 @@ from isaaclab.assets import BaseArticulation
 from isaaclab.envs.mdp.actions.actions_cfg import JointActionCfg
 from isaaclab.envs.mdp.actions.joint_actions import JointAction
 from isaaclab.managers import CommandTerm, CommandTermCfg, ManagerTermBase, ObservationTermCfg, SceneEntityCfg
+from isaaclab_hiveboard_rl.tasks.robot import robot_cfg
+
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.configclass import configclass
+from isaaclab.sim.utils import clone
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
@@ -42,6 +45,41 @@ VALVE_JOINT = "RevoluteJoint"
 # HiveBoard ball-valve limits are [-pi/2, 0]; negative rotation opens it.
 VALVE_CLOSED_RAD = 0.0
 VALVE_OPEN_RAD = -1.5707963267948966
+
+
+@clone
+def spawn_movable_panel(prim_path, cfg, translation=None, orientation=None):
+    """Give the visual-only USD a body so Newton tracks its reset transform."""
+    from isaaclab.sim.spawners.from_files.from_files import spawn_from_usd_file
+    from pxr import UsdPhysics
+
+    prim = spawn_from_usd_file(prim_path, cfg.usd_path, cfg, translation, orientation)
+    body = UsdPhysics.RigidBodyAPI.Apply(prim)
+    body.CreateKinematicEnabledAttr(True)
+    UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(1.0)
+    return prim
+
+
+def reset_panel_from_valve(env: ManagerBasedEnv, env_ids: torch.Tensor | slice | None) -> None:
+    """Keep the visual panel mounted behind the valve base after a reset.
+
+    Other valve tasks reuse these events but retain their own panel scenes.
+    Only the movable BallValve panel needs this synchronization.
+    """
+    if env.cfg.valve_task.asset_name != "ball_valve":
+        return
+    valve = env.scene["ball_valve"]
+    panel = env.scene["honeycomb"]
+    ids = torch.arange(env.num_envs, device=env.device)
+    if env_ids is not None:
+        ids = ids[env_ids]
+    pose = valve.data.root_link_pose_w[ids].clone()
+    offset = torch.tensor((-0.04, 0.0, 0.0), device=env.device).expand(len(ids), -1)
+    pose[:, :3] += math_utils.quat_apply(pose[:, 3:7], offset)
+    panel.write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
+    panel.write_root_velocity_to_sim_index(
+        root_velocity=torch.zeros(len(ids), 6, device=env.device), env_ids=ids
+    )
 
 # TCP pose in the lever's ``lever_pivot`` frame at the cuRobo expert's grasp,
 # measured by ``scripts/rl/measure_grasp_offset.py`` by replaying the expert in
@@ -357,6 +395,8 @@ def reset_joints_from_postures(
         q[:, pitch] = torch.where(flip, -q[:, pitch], q[:, pitch])
         q[:, roll2] = torch.where(flip, r2, q[:, roll2])
         q = torch.minimum(torch.maximum(q, low), high)
+    limits = asset.data.joint_pos_limits.torch[ids][:, asset_cfg.joint_ids]
+    q = q.clamp(min=limits[..., 0], max=limits[..., 1])
     asset.write_joint_position_to_sim_index(position=q, joint_ids=asset_cfg.joint_ids, env_ids=ids)
     asset.write_joint_velocity_to_sim_index(velocity=torch.zeros_like(q), joint_ids=asset_cfg.joint_ids, env_ids=ids)
 
@@ -410,10 +450,9 @@ def grasp_target_w(env: ManagerBasedEnv) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def tcp_w(env: ManagerBasedEnv) -> tuple[torch.Tensor, torch.Tensor]:
-    """TCP pose in world frame [m], xyzw (``ANYMAL_EE``: gripper body plus TCP offset)."""
-    from isaaclab_hiveboard.assets import ANYMAL_EE
-
-    return _body_frame_w(env, "robot", ANYMAL_EE.body_name, ANYMAL_EE.tcp_offset.pos, ANYMAL_EE.tcp_offset.rot)
+    """Configured robot TCP pose in world frame [m], xyzw."""
+    cfg = robot_cfg(env)
+    return _body_frame_w(env, "robot", cfg.tcp_body, cfg.tcp_pos, cfg.tcp_rot)
 
 
 def tcp_grasp_error(env: ManagerBasedEnv) -> tuple[torch.Tensor, torch.Tensor]:
@@ -512,7 +551,7 @@ def pad_force_split(
     the lever through the fingers.
     """
     robot: BaseArticulation = env.scene["robot"]
-    left, right = (robot.find_bodies(name)[0][0] for name in ("left_inner_finger", "right_inner_finger"))
+    left, right = (robot.find_bodies(name)[0][0] for name in robot_cfg(env).finger_body_names)
     axis = robot.data.body_pos_w.torch[:, right] - robot.data.body_pos_w.torch[:, left]
     axis = axis / axis.norm(dim=-1, keepdim=True).clamp(min=1.0e-6)
     squeeze, lateral = [], []

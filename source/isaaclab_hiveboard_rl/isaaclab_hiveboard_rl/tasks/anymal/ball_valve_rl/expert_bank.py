@@ -27,6 +27,7 @@ and the valve reference are shifted by the idle steps dropped from the reach.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -35,25 +36,16 @@ import torch
 from isaaclab.assets import BaseArticulation
 from isaaclab.managers import EventTermCfg, ManagerTermBase
 
-from isaaclab_hiveboard.assets.anymal.bench import ANYMAL_ARM_JOINT_NAMES
-
 from .valve_dynamics import VALVE_DYNAMICS
+from isaaclab_hiveboard_rl.tasks.robot import RobotCfg, robot_cfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 
 #: Every joint of the Robotiq linkage. The bank stores all of them so an
 #: episode can start mid-grasp without the solver snapping the linkage.
-GRIPPER_LINKAGE_JOINTS = [
-    "finger_joint",
-    "left_outer_finger_joint",
-    "left_inner_finger_joint",
-    "left_inner_finger_pad_joint",
-    "right_outer_knuckle_joint",
-    "right_outer_finger_joint",
-    "right_inner_finger_joint",
-    "right_inner_finger_pad_joint",
-]
+GRIPPER_LINKAGE_JOINTS = list(RobotCfg().hand_joint_names)
+
 #: Pad force [N] above which a finger pad counts as touching the lever. The
 #: expert's pads read 0 N before the grasp and 8-14 N while turning.
 CONTACT_FORCE_N = 1.0
@@ -64,16 +56,40 @@ IDLE_STEP_RAD = 1.0e-3
 class ExpertBank:
     """Expert references precomputed per trajectory, on the simulation device."""
 
-    def __init__(self, path: str, device: str, valve_open_rad: float, task: str | None = None):
+    def __init__(
+        self, path: str, device: str, valve_open_rad: float, task: str | None = None,
+        robot: RobotCfg | None = None, dt: float | None = None,
+    ):
         bank = torch.load(path, map_location="cpu", weights_only=False)
         meta = bank["meta"]
         if task is not None and meta.get("task") != task:
             raise ValueError(f"{path} was recorded on {meta.get('task')}, not {task}")
-        if list(meta["arm_joint_names"]) != list(ANYMAL_ARM_JOINT_NAMES):
-            raise ValueError(f"Bank joint order {meta['arm_joint_names']} differs from {ANYMAL_ARM_JOINT_NAMES}")
+        robot = robot or RobotCfg()
+        if list(meta["arm_joint_names"]) != list(robot.arm_joint_names):
+            raise ValueError(f"Bank joint order {meta['arm_joint_names']} differs from {robot.arm_joint_names}")
+        if meta.get("robot", robot.name) != robot.name:
+            raise ValueError(f"Bank robot {meta['robot']} differs from {robot.name}")
+        if not math.isfinite(float(meta["dt"])) or float(meta["dt"]) <= 0:
+            raise ValueError("Bank sample interval must be finite and positive")
+        if dt is not None and abs(float(meta["dt"]) - dt) > 1e-7:
+            raise ValueError(f"Bank sample interval {meta['dt']} differs from environment {dt}")
+        n, t, joints = bank["arm_q"].shape
+        if not n or t < 2 or joints != len(robot.arm_joint_names):
+            raise ValueError("Bank must contain nonempty trajectories with the configured arm dimensions")
+        expected = {
+            "arm_q": (n, t, joints), "arm_target": (n, t, joints), "arm_q0": (n, joints),
+            "gripper_joint_pos": (n, t, len(robot.hand_joint_names)), "pad_force": (n, t, 2),
+            "valve_angle": (n, t), "gripper_q": (n, t), "gripper_cmd": (n, t),
+            "valve_pose_env": (n, 7), "valve_angle0": (n,), "t_open": (n,),
+        }
+        for key, shape in expected.items():
+            if key not in bank or tuple(bank[key].shape) != shape:
+                raise ValueError(f"Bank {key} must have shape {shape}")
+            if not torch.isfinite(bank[key]).all():
+                raise ValueError(f"Bank {key} contains nonfinite values")
         self.meta = meta
         self.size = len(bank["arm_q"])
-        q = bank["arm_q"].float()  # (N, T, 6)
+        q = bank["arm_q"].float()  # (N, T, arm joints)
         valve = bank["valve_angle"].float()  # (N, T)
         # Grasp step: first step of the grip, or of the actuation when it grips
         # by itself (the ball valve's turn closes the gripper). Banks without
@@ -102,7 +118,7 @@ class ExpertBank:
             moving = (path[1:] - path[:-1]).abs().amax(dim=-1) > IDLE_STEP_RAD
             paths.append(torch.cat((path[:1], path[1:][moving])))
         horizon = max(len(path) for path in paths)
-        self.reach = torch.stack([torch.cat((p, p[-1:].expand(horizon - len(p), -1))) for p in paths])  # (N, H, 6)
+        self.reach = torch.stack([torch.cat((p, p[-1:].expand(horizon - len(p), -1))) for p in paths])  # (N, H, arm joints)
         self.grasp_step = torch.tensor([len(p) - 1 for p in paths])
 
         # The expert's own commands by time, for behaviour cloning (expert_action).
@@ -121,9 +137,9 @@ class ExpertBank:
             raise ValueError(f"{path} has no pad_force; rebuild it with scripts/rl/build_expert_bank.py")
         # Per-pad contact with the lever, (N, T, 2).
         self.contact = (bank["pad_force"].float() > CONTACT_FORCE_N).float()
-        if list(meta.get("gripper_joint_names", [])) != GRIPPER_LINKAGE_JOINTS:
+        if list(meta.get("gripper_joint_names", [])) != list(robot.hand_joint_names):
             raise ValueError(f"{path} has no gripper_joint_pos; rebuild it with scripts/rl/build_expert_bank.py")
-        # The whole Robotiq linkage, for starting episodes mid-grasp, (N, T, 8).
+        # Every hand joint in robot-config order, for starting episodes mid-grasp.
         self.gripper_joint_pos = bank["gripper_joint_pos"].float()
         self.dt = float(meta["dt"])
         self.idle_shift = grasp - self.grasp_step
@@ -165,7 +181,7 @@ class ExpertBank:
                 setattr(self, name, getattr(self, name).to(device))
 
     def reach_reference(self, idx: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
-        """Expert joints at episode ``step`` (held at the grasp afterwards), ``(len(idx), 6)``."""
+        """Expert joints at episode ``step`` (held at the grasp afterwards), ``(len(idx), arm joints)``."""
         return self.reach[idx, step.clamp(max=self.reach.shape[1] - 1)]
 
     def _bank_step(self, idx: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
@@ -183,7 +199,7 @@ class ExpertBank:
         return self.valve[idx, self._bank_step(idx, step)]
 
     def gripper_reference(self, idx: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
-        """Expert finger joint position at episode ``step``, ``(len(idx),)`` [rad]."""
+        """Expert finger joint position at episode ``step``, ``(len(idx),)`` [rad or m]."""
         return self.gripper_q[idx, self._bank_step(idx, step)]
 
     def gripper_closed_reference(self, idx: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
@@ -195,7 +211,7 @@ class ExpertBank:
         return self.contact[idx, self._bank_step(idx, step)]
 
     def turn_reference(self, idx: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
-        """Expert measured joints at episode ``step``, ``(len(idx), 6)``."""
+        """Expert measured joints at episode ``step``, ``(len(idx), arm joints)``."""
         return self.q[idx, self._bank_step(idx, step)]
 
     def joint_reference(self, idx: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
@@ -247,12 +263,14 @@ class reset_from_expert_bank(ManagerTermBase):
         from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl import mdp
 
         valve_task = mdp.valve_task(env)
-        self.bank = ExpertBank(cfg.params["path"], env.device, valve_task.open_rad, cfg.params.get("expert_task"))
+        self.robot = robot_cfg(env)
+        self.bank = ExpertBank(cfg.params["path"], env.device, valve_task.open_rad, cfg.params.get("expert_task"),
+                               self.robot, env.step_dt)
         self.index = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         self.start_step = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         robot: BaseArticulation = env.scene["robot"]
-        self._hand_ids = robot.find_joints(GRIPPER_LINKAGE_JOINTS, preserve_order=True)[0]
-        self._arm_ids = robot.find_joints(list(ANYMAL_ARM_JOINT_NAMES), preserve_order=True)[0]
+        self._hand_ids = robot.find_joints(list(self.robot.hand_joint_names), preserve_order=True)[0]
+        self._arm_ids = robot.find_joints(list(self.robot.arm_joint_names), preserve_order=True)[0]
         # The joint the bank recorded as gripper_q (build_expert_bank.py).
         self._finger_id = robot.find_joints(env.cfg.actions.gripper_action.joint_names)[0][0]
         self._valve_name = valve_task.asset_name
@@ -276,10 +294,9 @@ class reset_from_expert_bank(ManagerTermBase):
             self.index[ids] = 0
             self.start_step[ids] = 0
             from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl import mdp
-            from isaaclab_hiveboard_rl.tasks.anymal.ball_valve_rl.env import ARM_POSTURES
 
             robot = env.scene["robot"]
-            home = torch.tensor(ARM_POSTURES["home"], device=env.device).expand(len(ids), -1)
+            home = torch.tensor(self.robot.home, device=env.device).expand(len(ids), -1)
             robot.write_joint_position_to_sim_index(position=home, joint_ids=self._arm_ids, env_ids=ids)
             mdp.write_valve_angle(env, ids, torch.full((len(ids),), env.cfg.valve_task.closed_rad, device=env.device))
             return
@@ -392,7 +409,7 @@ def _bank_term(env: ManagerBasedEnv) -> reset_from_expert_bank:
 
 
 def expert_action(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """The bank expert's action for the current step, in the arm action's command, ``(N, 7)``.
+    """The bank expert's action for the current step, in the arm action's command, ``(N, arm joints + 1)``.
 
     The expert's recorded joint targets and gripper command (-1 closes) by episode time, from where
     the episode started on its trajectory, on the bank's own timeline (idle steps included: this is
@@ -519,7 +536,7 @@ def expert_gripper_reference(
 
 
 def track_expert_gripper(env: ManagerBasedRLEnv, std: float) -> torch.Tensor:
-    """``exp(-(q_finger - q_expert(t))^2 / std^2)``: the fingers follow the expert's by episode time; ``std`` [rad].
+    """``exp(-(q_finger - q_expert(t))^2 / std^2)``: the fingers follow the expert's by episode time; ``std`` uses the hand joint's units.
 
     Tracks where the fingers are, not the open/close command: scoring the
     command's sign let teacher v21 cage the lever with half-closed fingers
