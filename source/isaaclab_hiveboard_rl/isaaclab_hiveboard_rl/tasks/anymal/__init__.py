@@ -1,1 +1,0 @@
-"""ANYmal RL tasks."""
