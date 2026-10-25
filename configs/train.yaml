@@ -1,0 +1,144 @@
+env:
+  scene: {num_envs: 1024, env_spacing: 3.0}
+  sim:
+    physics:
+      newton_mjwarp: &physics
+        solver_cfg:
+          solver: newton
+          integrator: implicitfast
+          cone: elliptic
+          njmax: 600
+          nconmax: 300
+          iterations: 100
+          ls_iterations: 20
+          impratio: 10.0
+          ccd_iterations: 50
+          use_mujoco_contacts: false
+        num_substeps: 2
+        debug_mode: false
+        use_cuda_graph: false
+      default: *physics
+  actions:
+    arm_action: {scale: 0.1}
+  observations:
+    policy:
+      arm_joint_pos:
+        noise: {_target_: isaaclab.utils.noise.UniformNoiseCfg, n_min: -0.002, n_max: 0.002}
+      registered_mechanism:
+        params: {bias_pos: 0.01, bias_rot: 0.035, jitter_pos: 0.002, angle_noise: 0.035}
+      history_length: 5
+    teacher:
+      arm_joint_vel: {scale: 0.1}
+      tcp_to_grasp: {scale: 5.0}
+      pad_force: {scale: 0.02, clip: [0.0, 10.0]}
+      expert_gripper: {params: {follow_release: false, follow_reach: false}}
+      expert_mechanism_error: {scale: 5.0}
+  events:
+    robot_gravcomp: {params: {gravcomp: 1.0}}
+    mechanism_gravcomp: {params: {gravcomp: 1.0}}
+    robot_physics_material:
+      params:
+        static_friction_range: [0.3, 0.6]
+        dynamic_friction_range: [0.3, 0.5]
+        restitution_range: [0.0, 0.0]
+        num_buckets: 16
+    mechanism_physics_material:
+      params:
+        static_friction_range: [0.2, 1.0]
+        dynamic_friction_range: [0.2, 0.8]
+        restitution_range: [0.0, 0.0]
+        num_buckets: 16
+        make_consistent: true
+    contacts: {params: {ke: 40000.0, kd: 400.0, solimp: [0.95, 0.99, 0.001]}}
+    reset_from_bank: {params: {mid_start_prob: 0.5, standard: false}}
+  commands:
+    reference: {rate_range: [0.3, 0.3], engage_delay_s: 0.0}
+  rewards:
+    track_expert_coarse: {weight: 2.0, params: {std: 0.5}}
+    track_expert: {weight: 3.0, params: {std: 0.15}}
+    track_expert_velocity: {weight: 0.0, params: {std: 0.5}}
+    track_expert_gripper: {weight: 3.0}
+    track_expert_contact: {weight: 3.0}
+    track_expert_mechanism: {weight: 6.0, params: {std: 0.1}}
+    track_expert_mechanism_coarse: {weight: 5.0, params: {std: 0.5}}
+    action_rate: {weight: -0.5}
+    action_magnitude: {weight: -0.02}
+    arm_joint_vel: {weight: -0.001}
+    pad_force: {weight: -0.001, params: {max_force: 150.0}}
+    overspeed: {weight: -1.0, params: {factor: 1.5}}
+  terminations:
+    invalid: {params: {max_joint_vel: 50.0}}
+    expert_drift: {params: {max_error: 0.3}}
+    expert_mechanism_lag: {params: {max_error: 0.3}}
+  viewer: {origin_type: asset_body, eye: [-1.5, 1.5, 0.5], lookat: [0.0, 0.0, 0.0]}
+play:
+  scene: {num_envs: 16}
+  observations: {policy: {enable_corruption: false}}
+  events:
+    robot_physics_material: null
+    mechanism_physics_material: null
+    reset_from_bank: {params: {mid_start_prob: 0.0}}
+  terminations: {expert_drift: null, expert_mechanism_lag: null}
+  viewer: {origin_type: env, env_index: 0, eye: [0.75, -0.75, 1.02], lookat: [0.9, 0.0, 0.68]}
+expert:
+  events:
+    arm_delay: null
+    target_delay: null
+    reset_from_bank: null
+publication:
+  events:
+    reset_from_bank: {params: {standard: true, mid_start_prob: 0.0}}
+    robot_physics_material: null
+    mechanism_physics_material: null
+    dynamics:
+      params:
+        ranges:
+          friction: [0.05, 0.05]
+          damping: [0.0, 0.0]
+          spring: [0.0, 0.0]
+          breakaway: [0.0, 0.0]
+          armature: [0.005, 0.005]
+        stuck_prob: 0.0
+  observations:
+    policy:
+      enable_corruption: false
+      registered_mechanism:
+        params: {bias_pos: 0.0, bias_rot: 0.0, jitter_pos: 0.0, angle_noise: 0.0}
+  commands: {reference: {rate_range: [0.3, 0.3]}}
+agent:
+  num_steps_per_env: 32
+  max_iterations: 3000
+  save_interval: 100
+  logger: wandb
+  wandb_project: isaaclab-hiveboard
+  clip_actions: 1.0
+  obs_groups: {actor: [policy], critic: [teacher]}
+  actor:
+    hidden_dims: [512, 256, 128]
+    activation: elu
+    obs_normalization: true
+    distribution_cfg: {init_std: 0.6}
+  critic: {hidden_dims: [512, 256, 128], activation: elu, obs_normalization: true}
+  algorithm:
+    value_loss_coef: 1.0
+    use_clipped_value_loss: true
+    clip_param: 0.2
+    entropy_coef: 0.005
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    learning_rate: 0.0005
+    schedule: adaptive
+    gamma: 0.99
+    lam: 0.95
+    desired_kl: 0.01
+    max_grad_norm: 1.0
+bc:
+  epochs: 50
+  batch_size: 4096
+  lr: 0.001
+  weight_decay: 0.0001
+  gripper_weight: 1.0
+  val_fraction: 0.05
+  critic_epochs: 0
+  init_std: 0.1
+  action_history_noise: 0.5

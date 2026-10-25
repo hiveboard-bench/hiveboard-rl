@@ -1,0 +1,49 @@
+# description
+prim: Valve
+usd: BALL_VALVE_USD
+mounting:
+  pos: [1.0, 0.06, 0.804]
+  rot: [0.0, 0.0, 1.0, 0.0]
+viewer: {body_name: alavanca_pivot}
+
+# panel
+panel:
+  pos: [-0.04, 0.0, 0.0]
+  rot: [0.0, 0.0, 0.0, 1.0]
+
+# mechanism
+mechanism:
+  closed_end_stop: true
+  joints:
+    RevoluteJoint:
+      friction: 0.02
+      dynamic_friction: 0.0
+      viscous_friction: 0.0
+
+# frames
+frames:
+  path: Geometry/valvula_esfera/alavanca_pivot
+  rot: [0.0, 0.7071067811865476, 0.7071067811865476, 0.0]
+  targets:
+    approaching:
+      pos: [0.12, 0.06, 0.0]
+    lever_pivot:
+      pos: [0.03, 0.083944307, 0.0]
+    rotate_frame:
+      pos: [0.03, 0.0, 0.0]
+
+# interaction
+interaction:
+  grasp_frame: lever_pivot
+  mode: grasp
+
+# physics
+physics:
+  dynamics:
+    ranges:
+      friction: [0.05, 2.0]
+      damping: [0.0, 0.5]
+      breakaway: [0.0, 2.0]
+      armature: [0.001, 0.02]
+    stuck_prob: 0.25
+    stuck_breakaway: [2.0, 5.0]

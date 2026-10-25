@@ -1,0 +1,54 @@
+articulation: isaaclab_hiveboard.tasks.franka.common.FRANKA_NEWTON_CFG
+ee: isaaclab_hiveboard.assets.FRANKA_EE
+pads: [fr3_leftfinger, fr3_rightfinger]
+contact_shapes: /Robot/fr3_(left|right)finger/
+board: {pos: [1.404, 0.06, 1.04], rot: [0.7071067811865476, 0.0, -0.7071067811865476, 0.0]}
+planner:
+  robot_curobo_yaml: franka/cumotion/fr3.yaml
+  robot_urdf: franka/cumotion/fr3.urdf
+wrist_flip: null
+min_duration_s: {grip: 0.7, hold: 0.7, release: 0.8}
+grip_effort: {}
+pose_limits:
+  x: [-0.05, 0.05]
+  y: [-0.08, 0.08]
+  z: [0.0, 0.08]
+  roll: [0.0, 0.0]
+  pitch: [0.0, 0.0]
+  yaw: [0.0, 0.0]
+delay_s: 0.0
+delayed_groups: []
+actuator_groups: [fr3_shoulder, fr3_forearm]
+postures:
+  home: [0.0, -0.569, 0.0, -2.81, 0.0, 3.037, 0.741]
+arm_range: [-0.1, 0.1]
+robot:
+  arm_joint_names:
+    [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
+  hand_joint_names: [fr3_finger_joint1, fr3_finger_joint2]
+  finger_joint_names: [fr3_finger_joint1, fr3_finger_joint2]
+  implicit: true
+  diagnostic_joint: fr3_joint6
+env:
+  decimation: 33
+  sim: {dt: 0.0015151515151515152, render_interval: 33}
+  actions:
+    gripper_action:
+      joint_names: [fr3_finger_joint.*]
+      open_command_expr: {fr3_finger_joint.*: 0.04}
+      close_command_expr: {fr3_finger_joint.*: 0.01}
+      close_speed: 0.05
+  observations:
+    policy:
+      gripper_pos:
+        noise: {_target_: isaaclab.utils.noise.UniformNoiseCfg, n_min: -0.0002, n_max: 0.0002}
+      gripper_object: {params: {stopped_below: 0.035, moved_above: 0.0105, max_speed: 0.001}}
+  rewards:
+    track_expert_gripper: {params: {std: 0.002}}
+  events:
+    target_delay:
+      _target_: isaaclab.managers.EventTermCfg
+      func: isaaclab_hiveboard_rl.env:TargetDelay
+      mode: reset
+      params: {delay_range_s: [0.0, 0.04]}
+  viewer: {origin_type: env, env_index: 0, eye: [0.85, -0.75, 0.85], lookat: [0.6, 0.0, 0.1]}

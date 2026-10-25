@@ -1,0 +1,6 @@
+# objective
+asset: circuit_breaker
+goal: {start: 0.5235987755982988, target: -0.5235987755982988, tolerance: 0.1}
+
+# time
+episode_length_s: 9.0

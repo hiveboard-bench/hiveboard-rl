@@ -1,0 +1,11 @@
+# objective
+asset: m30_thread
+goal: {start: 0.0, target: -12.566370614359172, tolerance: 1.7951958020513104}
+
+# distribution
+initial:
+  pose:
+    roll: [-3.141592653589793, 3.141592653589793]
+
+# time
+episode_length_s: 57.0

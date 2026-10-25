@@ -1,20 +1,25 @@
+import os
+
 import gymnasium as gym
 
-import isaaclab_hiveboard
+from isaaclab_hiveboard_rl import env
 
-from isaaclab_hiveboard_rl import env, specs
 
-for robot, tool in specs.PAIRS:
-    for play in (False, True):
-        gym.register(
-            id=specs.task_id(robot, tool, play),
-            entry_point="isaaclab.envs:ManagerBasedRLEnv",
-            disable_env_checker=True,
-            kwargs={
-                "env_cfg_entry_point": lambda r=robot, t=tool, p=play: env.make_env_cfg(r, t, p),
-                "rsl_rl_cfg_entry_point": lambda r=robot, t=tool: (
-                    env.AnymalBallValveStudentPPORunnerCfg(experiment_name=f"{r}_{t}_student_ppo")
-                ),
-                "default_agent": "rsl_rl",
-            },
-        )
+def camel(name):
+    return "".join(word.capitalize() for word in name.split("_"))
+
+
+for robot in sorted(os.listdir(os.path.join(env.REPO_ROOT, "configs", "robots"))):
+    for task in sorted(os.listdir(os.path.join(env.REPO_ROOT, "configs", "tasks"))):
+        robot, task = robot.removesuffix(".yaml"), task.removesuffix(".yaml")
+        for mode, suffix in (("train", ""), ("play", "-Play")):
+            gym.register(
+                id=f"Isaac-HiveBoard-{camel(robot)}-{camel(task)}-RL{suffix}-v0",
+                entry_point="isaaclab.envs:ManagerBasedRLEnv",
+                disable_env_checker=True,
+                kwargs={
+                    "env_cfg_entry_point": lambda r=robot, t=task, m=mode: env.compose(r, t, m),
+                    "rsl_rl_cfg_entry_point": lambda r=robot, t=task: env.runner_cfg(r, t),
+                    "default_agent": "rsl_rl",
+                },
+            )

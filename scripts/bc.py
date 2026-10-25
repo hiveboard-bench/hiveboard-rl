@@ -7,27 +7,28 @@ import types
 
 import torch
 import torch.nn.functional as F
+import yaml
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", required=True)
-parser.add_argument("--epochs", type=int, default=50)
-parser.add_argument("--batch_size", type=int, default=4096)
-parser.add_argument("--lr", type=float, default=1.0e-3)
-parser.add_argument("--weight_decay", type=float, default=1.0e-4)
-parser.add_argument("--gripper_weight", type=float, default=1.0)
-parser.add_argument("--val_fraction", type=float, default=0.05, help="episodes held out")
+parser.add_argument("--epochs", type=int)
+parser.add_argument("--batch_size", type=int)
+parser.add_argument("--lr", type=float)
+parser.add_argument("--weight_decay", type=float)
+parser.add_argument("--gripper_weight", type=float)
+parser.add_argument("--val_fraction", type=float, help="episodes held out")
 parser.add_argument("--max_episodes", type=int, default=None)
 parser.add_argument("--include_failed", action="store_true")
-parser.add_argument("--critic_epochs", type=int, default=0, help="0 leaves the critic untrained")
-parser.add_argument("--init_std", type=float, default=0.1, help="actor std for PPO fine-tuning")
+parser.add_argument("--critic_epochs", type=int, help="0 leaves the critic untrained")
+parser.add_argument("--init_std", type=float, help="actor std for PPO fine-tuning")
 history = parser.add_mutually_exclusive_group()
 history.add_argument("--ignore_action_history", action="store_true")
-history.add_argument(
-    "--action_history_noise", type=float, default=0.5, help="std on normalized last actions"
-)
+history.add_argument("--action_history_noise", type=float, help="std on normalized last actions")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 parser.add_argument("--output_dir", default=None)
+with open(os.path.join(os.path.dirname(__file__), "..", "configs", "train.yaml")) as f:
+    parser.set_defaults(**yaml.safe_load(f)["bc"])
 args = parser.parse_args()
 
 SWITCH_WINDOW = 5

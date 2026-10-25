@@ -1,0 +1,77 @@
+articulation: isaaclab_hiveboard.assets.anymal.bench.ANYMAL_ARM_NEWTON_CFG
+ee: isaaclab_hiveboard.assets.ANYMAL_EE
+pads: [robotiq_2f_140/left_inner_finger, robotiq_2f_140/right_inner_finger]
+contact_shapes: /robotiq_2f_140/
+board: {pos: [0.0, 0.0, 0.0], rot: [0.0, 0.0, 0.0, 1.0]}
+planner:
+  robot_curobo_yaml: anymal/cumotion/dynaarm.yaml
+  robot_urdf: anymal/cumotion/dynaarm.urdf
+wrist_flip: [dynaarm_forearm_rotation, dynaarm_wrist_flexion, dynaarm_wrist_rotation]
+min_duration_s: {grip: 0.0, hold: 0.0, release: 0.0}
+grip_effort: {gripper: 20.0}
+pose_limits:
+  x: [-.inf, .inf]
+  y: [-.inf, .inf]
+  z: [-.inf, .inf]
+  roll: [-.inf, .inf]
+  pitch: [-.inf, .inf]
+  yaw: [-.inf, .inf]
+delay_s: &delay 0.04
+delayed_groups: &groups
+  - dynaarm_shoulder
+  - dynaarm_elbow
+  - dynaarm_forearm
+  - dynaarm_wrist_flex
+  - dynaarm_wrist_rot
+actuator_groups: *groups
+postures:
+  home: [0.0, 0.0, 1.7, 0.0, 0.0, 1.5708]
+  raised: [0.0, -0.4, 1.9, 0.0, 0.4, 1.5708]
+  lowered: [0.0, 0.3, 1.9, 0.0, -0.5, 1.5708]
+  left: [0.5, 0.0, 1.7, 0.0, 0.0, 1.5708]
+  right: [-0.5, 0.0, 1.7, 0.0, 0.0, 1.5708]
+  wrist_down: [0.0, 0.2, 1.8, 0.0, -0.8, 1.5708]
+  wrist_up: [0.0, 0.2, 1.8, 0.0, 0.8, 1.5708]
+arm_range: [-0.1, 0.1]
+robot:
+  arm_joint_names:
+    - dynaarm_shoulder_rotation
+    - dynaarm_shoulder_flexion
+    - dynaarm_elbow_flexion
+    - dynaarm_forearm_rotation
+    - dynaarm_wrist_flexion
+    - dynaarm_wrist_rotation
+  hand_joint_names:
+    - finger_joint
+    - left_outer_finger_joint
+    - left_inner_finger_joint
+    - left_inner_finger_pad_joint
+    - right_outer_knuckle_joint
+    - right_outer_finger_joint
+    - right_inner_finger_joint
+    - right_inner_finger_pad_joint
+  finger_joint_names: [finger_joint]
+  implicit: false
+  diagnostic_joint: dynaarm_wrist_flexion
+env:
+  decimation: 10
+  sim: {dt: 0.005, render_interval: 10}
+  actions:
+    gripper_action:
+      joint_names: [finger_joint]
+      open_command_expr: {finger_joint: 0.0}
+      close_command_expr: {finger_joint: 1.5}
+      close_speed: 2.0
+  observations:
+    policy:
+      gripper_pos:
+        noise: {_target_: isaaclab.utils.noise.UniformNoiseCfg, n_min: -0.01, n_max: 0.01}
+      gripper_object: {params: {stopped_below: 0.745, moved_above: 0.3, max_speed: 0.05}}
+  rewards:
+    track_expert_gripper: {params: {std: 0.1}}
+  events:
+    arm_delay:
+      _target_: isaaclab.managers.EventTermCfg
+      func: isaaclab_hiveboard_rl.env:randomize_actuator_delay
+      mode: reset
+      params: {delay_range_s: [0.0, *delay], groups: *groups}

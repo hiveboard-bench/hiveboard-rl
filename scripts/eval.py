@@ -8,7 +8,6 @@ import sys
 import gymnasium as gym
 import torch
 from isaaclab_hiveboard_rl import env as mdp
-from isaaclab_hiveboard_rl import specs
 
 from isaaclab.app import add_launcher_args, launch_simulation
 from isaaclab.envs.utils import video_recorder
@@ -32,7 +31,6 @@ parser.add_argument("--policy", choices=("checkpoint", "expert"), default="check
 parser.add_argument("--save", help="record expert demos to this file")
 parser.add_argument("--command", choices=mdp.ARM_COMMANDS, default="increment")
 parser.add_argument("--keep_failed", action="store_true")
-parser.add_argument("--standard", action="store_true")
 parser.add_argument("--export", action="store_true")
 parser.add_argument("--video", help="Newton viewer video dir")
 parser.add_argument("--publication", help="RTX video dir")
@@ -49,48 +47,24 @@ if not expert:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     hydra_args += checkpoint.get("bc_overrides", [])
 if args.publication:
-    args.standard = True
     args.num_envs = args.episodes = 1
-    args.visualizer = ["newton_rtx"]
-elif args.video:
-    args.visualizer = ["newton_gl"]
-elif args.visualizer is None and not getattr(args, "visualizer_explicit", False):
-    args.visualizer = []
+args.visualizer = ["newton_rtx"] if args.publication else ["newton_gl"] if args.video else []
 sys.argv = [sys.argv[0], *hydra_args]
 
 env_cfg, agent_cfg = resolve_task_config(args.task, "rsl_rl_cfg_entry_point")
 env_cfg.scene.num_envs = min(args.num_envs, args.episodes)
 env_cfg.seed = args.seed
-spec = specs.spec(env_cfg.robot, env_cfg.tool)
 reset_cfg = env_cfg.events.reset_from_bank
 if expert:
     env_cfg.actions.arm_action.command = args.command
     env_cfg.terminations.expert_drift = None
-    env_cfg.terminations.expert_valve_lag = None
+    env_cfg.terminations.expert_mechanism_lag = None
     reset_cfg.func = mdp.reset_from_expert_bank_in_order
     reset_cfg.params["seed"] = args.seed
-if args.standard:
-    reset_cfg.params.update(standard=True, mid_start_prob=0.0)
-    env_cfg.events.robot_physics_material = None
-    env_cfg.events.valve_physics_material = None
-    env_cfg.events.valve_dynamics.params.update(
-        ranges={
-            "friction": (0.05, 0.05),
-            "damping": (0.0, 0.0),
-            "spring": (0.0, 0.0),
-            "breakaway": (0.0, 0.0),
-            "armature": (0.005, 0.005),
-        },
-        stuck_prob=0.0,
-    )
-    env_cfg.observations.policy.enable_corruption = False
-    env_cfg.observations.policy.registered_valve.params.update(
-        bias_pos=0.0, bias_rot=0.0, jitter_pos=0.0, angle_noise=0.0
-    )
-    env_cfg.commands.valve_turn.rate_range = (0.3, 0.3)
-if args.standard or (expert and args.save is None):
-    for name in ("arm_delay", "target_delay"):
-        term = getattr(env_cfg.events, name, None)
+if args.publication:
+    mdp.merge(env_cfg, mdp.load("train")["publication"])
+if args.publication or (expert and args.save is None):
+    for term in (env_cfg.events.arm_delay, env_cfg.events.target_delay):
         if term is not None:
             term.params["delay_range_s"] = (0.0, 0.0)
 source = reset_cfg.params["path"] if expert else args.checkpoint
@@ -151,10 +125,10 @@ with launch_simulation(env_cfg, args):
         policy = runner.get_inference_policy(device=uenv.device)
 
     n_envs, dev, dt = uenv.num_envs, uenv.device, uenv.step_dt
-    hold, tolerance = spec["hold"], spec["success_tolerance_rad"]
-    turn = uenv.command_manager.get_term("valve_turn")
+    hold_dist = uenv.cfg.mechanism.hold_dist
+    turn = uenv.command_manager.get_term("reference")
     robot = uenv.scene["robot"]
-    profile = uenv.cfg.rl_robot
+    profile = uenv.cfg.robot
     gripper_body = robot.find_bodies(profile.tcp_body)[0][0]
     arm_ids = robot.find_joints(list(profile.arm_joint_names), preserve_order=True)[0]
     gripper_action = uenv.action_manager.get_term("gripper_action")
@@ -174,7 +148,7 @@ with launch_simulation(env_cfg, args):
             "max_pad_force",
             "max_pad_squeeze",
             "max_pad_lateral",
-            "max_valve_rate",
+            "max_mechanism_rate",
             "max_tcp_speed",
             "turn_rate_sum",
             "turn_steps",
@@ -216,27 +190,27 @@ with launch_simulation(env_cfg, args):
     with torch.inference_mode():
         while len(episodes) < args.episodes:
             dist, ang = mdp.tcp_grasp_error(uenv)
-            progress = mdp.valve_progress(uenv)
-            opened = mdp.valve_open_success(uenv, tolerance)
-            stats["reached"] |= dist < hold["dist_threshold"]
-            held = mdp.lever_held(uenv, hold["dist_threshold"], hold["ang_threshold"])
+            progress = mdp.mechanism_progress(uenv)
+            opened = mdp.succeeded(uenv)
+            stats["reached"] |= dist < hold_dist
+            held = mdp.held(uenv)
             first_hold = held & stats["grasp_wrist"].isnan()
             stats["grasp_wrist"][first_hold] = robot.data.joint_pos.torch[
                 first_hold, arm_ids[wrist_col]
             ]
             stats["grasped"] |= held
             stats["opened_any"] |= opened
-            stats["clear"] = mdp.released_and_clear(uenv, tolerance)
+            stats["clear"] = mdp.released_and_clear(uenv)
             stats["end_progress"] = progress.clone()
             stats["end_tcp_dist"] = dist.clone()
-            stats["end_pad_force"] = mdp.pad_valve_force(uenv).max(dim=-1).values
+            stats["end_pad_force"] = mdp.pad_force(uenv).max(dim=-1).values
             credited = opened & mdp.opening_credited(uenv, held, stats["grasped"])
             new = credited & ~stats["success"]
             stats["t_success"][new] = step_count[new] * dt
             stats["success"] |= credited
             stats["max_progress"] = torch.maximum(stats["max_progress"], progress)
             turning = held & (progress > 0.05) & (progress < 0.95)
-            stats["turn_rate_sum"] += mdp.valve_state(uenv)[:, 1].abs() * turning
+            stats["turn_rate_sum"] += mdp.mechanism_state(uenv)[:, 1].abs() * turning
             stats["turn_steps"] += turning.float()
             stats["commanded_rate"] = turn.rate.clone()
             q = robot.data.joint_pos.torch[:, arm_ids]
@@ -273,8 +247,8 @@ with launch_simulation(env_cfg, args):
             stats["prev_v"] = v.clone()
             speed = torch.norm(robot.data.body_lin_vel_w.torch[:, gripper_body], dim=-1)
             stats["max_tcp_speed"] = torch.maximum(stats["max_tcp_speed"], speed)
-            stats["max_valve_rate"] = torch.maximum(
-                stats["max_valve_rate"], mdp.valve_state(uenv)[:, 1].abs()
+            stats["max_mechanism_rate"] = torch.maximum(
+                stats["max_mechanism_rate"], mdp.mechanism_state(uenv)[:, 1].abs()
             )
             squeeze, lateral = mdp.pad_force_split(uenv)
             stats["max_pad_squeeze"] = torch.maximum(
@@ -284,7 +258,7 @@ with launch_simulation(env_cfg, args):
                 stats["max_pad_lateral"], lateral.max(dim=-1).values
             )
             stats["max_pad_force"] = torch.maximum(
-                stats["max_pad_force"], mdp.pad_valve_force(uenv).max(dim=-1).values
+                stats["max_pad_force"], mdp.pad_force(uenv).max(dim=-1).values
             )
 
             action = mdp.expert_action(uenv) if expert else policy(obs)
@@ -331,7 +305,7 @@ with launch_simulation(env_cfg, args):
                         "max_pad_force_n": float(stats["max_pad_force"][i]),
                         "max_pad_squeeze_n": float(stats["max_pad_squeeze"][i]),
                         "max_pad_lateral_n": float(stats["max_pad_lateral"][i]),
-                        "max_valve_rate_rad_s": float(stats["max_valve_rate"][i]),
+                        "max_mechanism_rate_rad_s": float(stats["max_mechanism_rate"][i]),
                         "max_tcp_speed_m_s": float(stats["max_tcp_speed"][i]),
                         "commanded_rate_rad_s": float(stats["commanded_rate"][i]),
                         "achieved_rate_rad_s": float(
@@ -489,7 +463,7 @@ summary = {
     "pad_lateral_n_p50_p99": torch.quantile(
         torch.tensor([e["max_pad_lateral_n"] for e in episodes]), quantiles
     ).tolist(),
-    "mean_peak_valve_rate_rad_s": sum(e["max_valve_rate_rad_s"] for e in episodes) / n,
+    "mean_peak_mechanism_rate_rad_s": sum(e["max_mechanism_rate_rad_s"] for e in episodes) / n,
     "mean_peak_tcp_speed_m_s": sum(e["max_tcp_speed_m_s"] for e in episodes) / n,
     "mean_commanded_rate_rad_s": sum(e["commanded_rate_rad_s"] for e in episodes) / n,
     "mean_achieved_rate_rad_s": nanmean([e["achieved_rate_rad_s"] for e in episodes]),
@@ -552,7 +526,7 @@ print(
     f" | achieved {summary['mean_achieved_rate_rad_s']:.2f} rad/s (mean while held, 5-95% open)"
 )
 print(
-    f"speeds       mean peak valve rate {summary['mean_peak_valve_rate_rad_s']:.2f} rad/s"
+    f"speeds       mean peak mechanism rate {summary['mean_peak_mechanism_rate_rad_s']:.2f} rad/s"
     f" | mean peak gripper speed {summary['mean_peak_tcp_speed_m_s']:.2f} m/s"
 )
 print(f"invalid      {summary['invalid_episodes']} episodes")
