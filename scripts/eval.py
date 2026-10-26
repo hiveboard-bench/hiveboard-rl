@@ -25,7 +25,7 @@ from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
 REVERSAL_RATE = 0.05
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--task", default="Isaac-HiveBoard-Anymal-BallValve-RL-Play-v0")
+parser.add_argument("--task", default="Isaac-HiveBoard-Anymal-OpenBallValve-RL-Play-v0")
 parser.add_argument("--checkpoint")
 parser.add_argument("--policy", choices=("checkpoint", "expert"), default="checkpoint")
 parser.add_argument("--save", help="record expert demos to this file")
@@ -125,11 +125,10 @@ with launch_simulation(env_cfg, args):
         policy = runner.get_inference_policy(device=uenv.device)
 
     n_envs, dev, dt = uenv.num_envs, uenv.device, uenv.step_dt
-    hold_dist = uenv.cfg.mechanism.hold_dist
     turn = uenv.command_manager.get_term("reference")
     robot = uenv.scene["robot"]
     profile = uenv.cfg.robot
-    gripper_body = robot.find_bodies(profile.tcp_body)[0][0]
+    gripper_body = robot.find_bodies(profile.ee.body_name)[0][0]
     arm_ids = robot.find_joints(list(profile.arm_joint_names), preserve_order=True)[0]
     gripper_action = uenv.action_manager.get_term("gripper_action")
     bank_term = uenv.expert_bank_term
@@ -192,7 +191,7 @@ with launch_simulation(env_cfg, args):
             dist, ang = mdp.tcp_grasp_error(uenv)
             progress = mdp.mechanism_progress(uenv)
             opened = mdp.succeeded(uenv)
-            stats["reached"] |= dist < hold_dist
+            stats["reached"] |= dist < mdp.HOLD_DIST
             held = mdp.held(uenv)
             first_hold = held & stats["grasp_wrist"].isnan()
             stats["grasp_wrist"][first_hold] = robot.data.joint_pos.torch[

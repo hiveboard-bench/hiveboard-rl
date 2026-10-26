@@ -45,9 +45,10 @@ test:
 [script]
 all threshold="0.8" *args:
     set -eu
+    tasks=$(uv run python -c "from isaaclab_hiveboard.tasks import TASKS; print(*TASKS)")
     for robot in $(ls configs/robots | sed 's/.yaml//'); do
-        for task in $(ls configs/tasks | sed 's/.yaml//'); do
-            just --set robot "$robot" --set task "$task" bank
+        for task in $tasks; do
+            just --set robot "$robot" --set task "$task" bank || continue
             bank="logs/expert_bank/${robot}_${task}.pt"
             gate="b = torch.load('$bank', weights_only=False)['meta']['expert_success']"
             gate="$gate; print('Expert success:', b); raise SystemExit(b < {{threshold}})"

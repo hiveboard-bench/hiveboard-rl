@@ -9,22 +9,11 @@ from isaaclab_hiveboard_rl import env as mdp
 import isaaclab.utils.math as math_utils
 from isaaclab.app import add_launcher_args, launch_simulation
 from isaaclab.envs import ManagerBasedRLEnv
-from isaaclab.envs import mdp as base_mdp
-from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
 from isaaclab.envs.utils.video_recorder_cfg import VideoRecorderCfg
-from isaaclab.managers import EventTermCfg, ManagerTermBase, SceneEntityCfg
+from isaaclab.managers import EventTermCfg
 from isaaclab.managers.recorder_manager import RecorderManagerBaseCfg
 
-from isaaclab_hiveboard.mdp.commands.sequential_pose_command import (
-    PHASES,
-    WRIST_BRANCH_NEAREST,
-    MechanismGoalCfg,
-    SequentialPoseCommandCfg,
-    _CuroboPlannedGoToFrameHandler,
-    _GoToFrameHandler,
-    _RotateFrameHandler,
-)
-from isaaclab_hiveboard.mdp.commands.skills import SkillSet
+from isaaclab_hiveboard.mdp.commands.sequential_pose_command import PHASES
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--robot", default="anymal")
@@ -44,112 +33,10 @@ add_launcher_args(parser)
 args = parser.parse_args()
 args.visualizer = ["newton_gl"] if args.video else []
 
-EXPERT_DIVERSITY = ("turn_rate", "reach_scale", "grasp_shift", "grasp_roll", "turn_overshoot")
-
-
-class sample_expert_diversity(ManagerTermBase):
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
-        self.values = torch.zeros(env.num_envs, len(EXPERT_DIVERSITY), device=env.device)
-        self.rotate = None
-        env.expert_diversity_term = self
-
-    def __call__(self, env, env_ids, ranges, wrist_branch_nearest, grasp_axes, overshoot):
-        if self.rotate is None:
-            handlers = env.command_manager.get_term("pose_command")._command_handlers
-            rotates = [i for i, h in enumerate(handlers) if isinstance(h, _RotateFrameHandler)]
-            pushes = (
-                []
-                if rotates
-                else [
-                    i
-                    for i, h in enumerate(handlers)
-                    if isinstance(h, _GoToFrameHandler) and h.cfg.phase == "actuate"
-                ]
-            )
-            actuate = rotates or pushes
-            self.rotate = [handlers[i] for i in rotates]
-            self.push = [handlers[i] for i in pushes]
-            self.reach = [h for h in handlers[: actuate[0]] if isinstance(h, _GoToFrameHandler)]
-            self.grasp = self.reach[-1]
-            self.retreat = [
-                h
-                for h in handlers[actuate[-1] + 1 :]
-                if isinstance(h, _CuroboPlannedGoToFrameHandler)
-            ]
-
-            def goal(handler):
-                cfg, name = handler._frame.cfg, handler.cfg.target_frame_name
-                frame = next(f for f in cfg.target_frames if f.name == name)
-                assert frame.prim_path == cfg.target_frames[0].prim_path
-                return math_utils.combine_frame_transforms(
-                    *(
-                        torch.tensor([x], device=env.device)
-                        for x in (
-                            frame.offset.pos,
-                            frame.offset.rot,
-                            handler.cfg.target_offset_pos,
-                            handler.cfg.target_offset_rot,
-                        )
-                    )
-                )
-
-            grasp = goal(self.grasp)
-            self.moved = self.reach[:-1] + self.push
-            self.moved_in_grasp = [
-                math_utils.subtract_frame_transforms(*grasp, *goal(h)) for h in self.moved
-            ]
-        ids = mdp.all_ids(env, env_ids)
-        n = len(ids)
-        values = torch.empty(n, len(EXPERT_DIVERSITY), device=env.device)
-        for i, name in enumerate(EXPERT_DIVERSITY[:-1]):
-            values[:, i].uniform_(*ranges[name])
-        task = env.cfg.mechanism
-        friction, _, spring, _, _ = env.dynamics_term.params[ids].unbind(dim=-1)
-        torque = friction + spring * abs(task.open_rad - task.closed_rad)
-        values[:, -1] = overshoot[0] + overshoot[1] * torque
-        self.values[ids] = values
-        turn_rate, reach_scale, shift, roll, extra = values.unbind(dim=-1)
-        for rotate in self.rotate:
-            rotate.speed_scale[ids] = turn_rate / rotate.cfg.angular_velocity
-            rotate.angle_extra_rad[ids] = extra
-        for push in self.push:
-            push.speed_scale[ids] = turn_rate / push.cfg.velocity
-        for handler in self.reach:
-            handler.speed_scale[ids] = reach_scale
-        if wrist_branch_nearest:
-            for handler in self.reach + self.retreat:
-                handler.wrist_branch[ids] = WRIST_BRANCH_NEAREST
-                handler.forearm_winding[ids] = 0.0
-        shift_axis = torch.tensor(grasp_axes[0], device=env.device).expand(n, 3)
-        roll_axis = torch.tensor(grasp_axes[1], device=env.device).expand(n, 3)
-        grasp_pos = shift_axis * shift[:, None]
-        grasp_quat = math_utils.quat_from_angle_axis(roll, roll_axis)
-        self.grasp.env_offset_pos[ids] = grasp_pos
-        self.grasp.env_offset_rot[ids] = grasp_quat
-        for handler, (k_pos, k_quat) in zip(self.moved, self.moved_in_grasp):
-            k_pos, k_quat = k_pos.expand(n, 3), k_quat.expand(n, 4)
-            moved = math_utils.combine_frame_transforms(grasp_pos, grasp_quat, k_pos, k_quat)
-            handler.env_offset_pos[ids], handler.env_offset_rot[ids] = (
-                math_utils.subtract_frame_transforms(k_pos, k_quat, *moved)
-            )
-
-
 robot = mdp.load(f"robots/{args.robot}")
-task = mdp.load(f"tasks/{args.task}")
-asset_name = task["asset"]
-diversity = {
-    "turn_rate": (0.25, 0.5),
-    "reach_scale": (0.75, 1.3),
-    "grasp_shift": (0.0, 0.0),
-    "grasp_roll": (0.0, 0.0),
-}
-grasp_axes = ((1.0, 0.0, 0.0),) * 2
-overshoot = (0.0, 0.0)
-max_open_s = math.inf
 output = args.output or mdp.bank_path(args.robot, args.task)
 env_cfg = mdp.compose(args.robot, args.task, "expert")
-profile, mechanism = env_cfg.robot, env_cfg.mechanism
+profile = env_cfg.robot
 arm = list(profile.arm_joint_names)
 env_cfg.sim.physics = env_cfg.sim.physics.newton_mjwarp
 env_cfg.scene.num_envs = args.num_envs
@@ -161,9 +48,8 @@ env_cfg.observations.policy.episode_time = None
 env_cfg.rewards = {}
 env_cfg.terminations = {"time_out": env_cfg.terminations.time_out}
 env_cfg.recorders = RecorderManagerBaseCfg()
-env_cfg.actions.arm_action = JointPositionActionCfg(
-    asset_name="robot", joint_names=arm, scale=1.0, use_default_offset=False, preserve_order=True
-)
+max_open_s = mdp.board.expert(env_cfg)
+env_cfg.commands.reference = None
 actuators = dict(env_cfg.scene.robot.actuators)
 for name in profile.actuator_groups:
     a = actuators[name]
@@ -176,195 +62,12 @@ env_cfg.scene.robot = mdp.delayed_actuators(
     args.arm_delay_s,
     env_cfg.sim.dt,
 )
-events = env_cfg.events
 if args.arm_delay_s:
-    events.arm_delay = EventTermCfg(
+    env_cfg.events.arm_delay = EventTermCfg(
         func=mdp.randomize_actuator_delay,
         mode="reset",
         params={"delay_range_s": (args.arm_delay_s,) * 2, "groups": robot["delayed_groups"]},
     )
-initial = task.get("initial", {})
-pose_range = {
-    "x": (-0.05, 0.05),
-    "y": (-0.06, 0.06),
-    "z": (-0.05, 0.05),
-    **{axis: (-math.pi / 12, math.pi / 12) for axis in ("roll", "pitch", "yaw")},
-    **initial.get("pose", {}),
-}
-events.reset_mechanism_root = EventTermCfg(
-    func=base_mdp.reset_root_state_uniform,
-    mode="reset",
-    params={
-        "pose_range": {
-            k: (max(low, robot["pose_limits"][k][0]), min(high, robot["pose_limits"][k][1]))
-            for k, (low, high) in pose_range.items()
-        },
-        "velocity_range": {},
-        "asset_cfg": SceneEntityCfg(mechanism.asset_name),
-    },
-)
-events.reset_mechanism_joint = EventTermCfg(
-    func=base_mdp.reset_joints_by_offset,
-    mode="reset",
-    params={
-        "position_range": initial.get("joint_offset", [0.0, 0.0]),
-        "velocity_range": (0.0, 0.0),
-        "asset_cfg": SceneEntityCfg(mechanism.asset_name, joint_names=[mechanism.joint_name]),
-    },
-)
-events.reset_arm = EventTermCfg(
-    func=mdp.reset_joints_from_postures,
-    mode="reset",
-    params={
-        "postures": robot["postures"],
-        "position_range": robot["arm_range"],
-        "asset_cfg": SceneEntityCfg("robot", joint_names=arm, preserve_order=True),
-    },
-)
-skills = SkillSet(robot_joint_names=arm, **robot["planner"])
-planned = {"plan_batch_size": args.num_envs}
-goto = {**planned, "wrist_flip_joints": robot["wrist_flip"]}
-minimum = robot["min_duration_s"]
-if asset_name == "ball_valve":
-    method_name = "ball_valve_turn"
-    diversity.update(grasp_shift=(-0.015, 0.015), grasp_roll=(-0.25, 0.25))
-    grasp_axes = ((0.0, 0.0, -1.0),) * 2
-    overshoot = (0.03, 0.05)
-    if profile.name == "anymal":
-        goto["upright_axis"] = (0.0, 1.0, 0.0)
-    commands = [
-        skills.approach("approaching", chain_with_next=True, **goto),
-        skills.engage(mechanism.grasp_frame, chain_with_next=not minimum["grip"], **goto),
-    ]
-    if minimum["grip"]:
-        commands.append(skills.grip(duration_s=minimum["grip"]))
-    commands.append(skills.turn(use_valve_angle=False, **planned))
-    if minimum["hold"]:
-        commands.append(skills.hold(phase="actuate", duration_s=minimum["hold"]))
-    commands.extend(
-        [
-            skills.release(duration_s=max(0.3, minimum["release"])),
-            skills.retreat(
-                "approaching",
-                distance_threshold=0.05,
-                canonicalize_upward=False,
-                hold_current_orientation=True,
-                **goto,
-            ),
-        ]
-    )
-elif asset_name == "small_valve":
-    method_name = "small_valve_turn"
-    diversity.update(grasp_shift=(-0.005, 0.005), grasp_roll=(-0.12, 0.12))
-    overshoot = (0.0, 0.05)
-    commands = [
-        skills.approach("approaching", chain_with_next=True, **goto),
-        skills.engage(mechanism.grasp_frame, **goto),
-        skills.grip(duration_s=max(0.3, minimum["grip"])),
-        skills.turn(angle_threshold_deg=0.25, **planned),
-        skills.release(duration_s=max(0.375, minimum["release"])),
-        skills.retreat("approaching", velocity=0.25, hold_current_orientation=True, **goto),
-    ]
-elif asset_name == "circuit_breaker":
-    method_name = "circuit_breaker_push"
-    diversity.update(turn_rate=(0.1, 0.2), grasp_shift=(-0.01, 0.01), grasp_roll=(-0.3, 0.3))
-    grasp_axes = ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0))
-    max_open_s = 5.0
-    commands = [
-        skills.approach("approaching", gripper_open=False, **goto),
-        skills.engage(mechanism.grasp_frame, gripper_open=False, **goto),
-        skills.move(
-            "lever_pivot_above",
-            velocity=0.15,
-            distance_threshold=0.02,
-            done_when_joint=(
-                mechanism.asset_name,
-                mechanism.joint_name,
-                -1.0,
-                mechanism.open_rad + 0.035,
-            ),
-            **goto,
-        ),
-        skills.hold(phase="actuate", duration_s=max(0.3, minimum["hold"])),
-        skills.retreat(
-            "lever_pivot_above",
-            target_offset_pos=(-0.07, 0.0, 0.0),
-            gripper_open=False,
-            velocity=0.15,
-            distance_threshold=0.02,
-            **goto,
-        ),
-        skills.retreat(
-            "approaching", gripper_open=False, velocity=0.25, hold_current_orientation=True, **goto
-        ),
-    ]
-elif asset_name == "m30_thread":
-    method_name = "m30_thread_regrasp"
-    diversity["turn_rate"] = (0.5, 0.75)
-    turn = {
-        **planned,
-        "angular_velocity": 0.6,
-        "angle_threshold_deg": 2.0,
-        "max_ee_rotation_deg": 120.0,
-        "screw_pitch_m_per_revolution": mechanism.screw.pitch_m_per_revolution,
-    }
-    commands = [skills.approach("approaching", **goto)]
-    for cycle in range(7):
-        commands.extend(
-            [
-                skills.engage(
-                    mechanism.grasp_frame,
-                    velocity=0.1,
-                    distance_threshold=0.01,
-                    until=MechanismGoalCfg(goal_tolerance=0.1),
-                    **goto,
-                ),
-                skills.grip(
-                    duration_s=max(0.5, minimum["grip"]), until=MechanismGoalCfg(goal_tolerance=0.1)
-                ),
-                skills.turn(until=MechanismGoalCfg(goal_tolerance=0.1), **turn),
-                skills.release(duration_s=max(0.4, minimum["release"])),
-                skills.retreat(
-                    "clear",
-                    velocity=0.1,
-                    distance_threshold=0.01,
-                    hold_current_orientation=cycle == 6,
-                    **goto,
-                ),
-            ]
-        )
-    commands.append(skills.retreat("approaching", hold_current_orientation=True, **goto))
-else:
-    raise ValueError(f"No expert method for {asset_name}")
-events.expert_diversity = EventTermCfg(
-    func=sample_expert_diversity,
-    mode="reset",
-    params={
-        "ranges": diversity,
-        "wrist_branch_nearest": bool(robot["wrist_flip"]),
-        "grasp_axes": grasp_axes,
-        "overshoot": overshoot,
-    },
-)
-events.sync_coupled_joint = EventTermCfg(func=mdp.sync_coupled_joint, mode="reset")
-env_cfg.commands.reference = None
-env_cfg.commands.pose_command = SequentialPoseCommandCfg(
-    asset_name="robot",
-    body_name=profile.tcp_body,
-    body_offset=SequentialPoseCommandCfg.OffsetCfg(
-        pos=tuple(profile.tcp_pos), rot=tuple(profile.tcp_rot)
-    ),
-    resampling_time_range=(1.0e6, 1.0e6),
-    open_task_prob=1.0,
-    output_joint_positions=True,
-    valve_asset_name=mechanism.asset_name,
-    valve_joint_name=mechanism.joint_name,
-    valve_joint_open=mechanism.open_rad,
-    valve_joint_closed=mechanism.closed_rad,
-    valve_min_delta_rad=0.35,
-    screw_coupling=mechanism.screw,
-    commands=commands,
-)
 if args.video:
     env_cfg.viewer.origin_type = "env"
     env_cfg.viewer.env_index = 0
@@ -558,15 +261,15 @@ with launch_simulation(env_cfg, args):
         "diagnostic_joint": profile.diagnostic_joint,
         "physics_dt": env.physics_dt,
         "seed": args.seed,
-        "mechanism": env_cfg.mechanism.to_dict(),
-        "method": method_name,
+        "task_cfg": env_cfg.task.to_dict(),
+        "method": env_cfg.task.asset.method,
         "dt": env.step_dt,
         "horizon": horizon,
         "arm_joint_names": arm,
         "gripper_joint_names": list(hand_names),
         "phases": list(PHASES),
-        "dynamics": list(mdp.DYNAMICS),
-        "expert_diversity": list(EXPERT_DIVERSITY),
+        "dynamics": list(mdp.board.DYNAMICS),
+        "expert_diversity": list(mdp.board.EXPERT_DIVERSITY),
         "expert_success": rate,
         "stats": stats,
         "sampled": {key: torch.cat(values) for key, values in sampled.items()},
@@ -586,7 +289,7 @@ with launch_simulation(env_cfg, args):
     g = torch.cat(sampled["grasp_in_frame"])
     g = g[~g[:, 0].isnan()]
     g[:, 3:] *= torch.where(g[:, 6:7] < 0, -1.0, 1.0)
-    task = env_cfg.mechanism
+    task = env_cfg.task.asset
     print(
         f"[BANK] TCP in grasp frame '{task.grasp_frame}' when the turn starts, "
         f"median: pos {[round(v, 4) for v in g[:, :3].median(dim=0).values.tolist()]}, "

@@ -5,163 +5,41 @@ from dataclasses import MISSING, is_dataclass
 import torch
 import warp as wp
 import yaml
-from hydra.utils import get_object, instantiate
-from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonManager
+from hydra.utils import instantiate
+from isaaclab_newton.physics import NewtonManager
 
-import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
-from isaaclab.actuators import DelayedPDActuatorCfg, IdealPDActuatorCfg, ImplicitActuatorCfg
+from isaaclab.actuators import DelayedPDActuatorCfg, IdealPDActuatorCfg
 from isaaclab.actuators.newton.adapter import read_group_parameter, write_group_parameter
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
-from isaaclab.envs import ManagerBasedRLEnvCfg, ViewerCfg
 from isaaclab.envs.mdp.actions.actions_cfg import JointActionCfg
 from isaaclab.envs.mdp.actions.joint_actions import JointAction
-from isaaclab.managers import (
-    ActionTerm,
-    ActionTermCfg,
-    CommandTerm,
-    CommandTermCfg,
-    ManagerTermBase,
-    SceneEntityCfg,
-)
+from isaaclab.managers import CommandTerm, CommandTermCfg, ManagerTermBase, SceneEntityCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg, FrameTransformerCfg
-from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
-from isaaclab.sim import SimulationCfg
-from isaaclab.sim.utils import clone
 from isaaclab.utils.configclass import configclass
 
 from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
-from isaaclab_hiveboard.assets import make_ee_frame
-from isaaclab_hiveboard.mdp.actions import RateLimitedBinaryJointPositionActionCfg
-from isaaclab_hiveboard.mdp.commands.sequential_pose_command import (
-    ScrewJointCouplingCfg,
-    register_screw_joint_mimic,
-)
-from isaaclab_hiveboard.mdp.events import (
-    apply_articulation_gravcomp,
-    set_contact_stiffness,
-    set_joint_limit_damping,
+from isaaclab_hiveboard import tasks as board
+from isaaclab_hiveboard.tasks import (
+    all_ids,
+    mechanism_asset,
+    mechanism_joint_id,
+    mechanism_position,
+    write_mechanism_position,
 )
 
 from isaaclab_tasks.core.cabinet import mdp as base_mdp
-from isaaclab_tasks.utils import PresetCfg
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 CONTACT_FORCE_N = 1.0
 IDLE_STEP_RAD = 1.0e-3
-DYNAMICS = ("friction", "damping", "spring", "breakaway", "armature")
-BREAKAWAY_WIDTH_RAD = 0.15
-SPRING_STATIC_RAD = 0.4
+HOLD_DIST = 0.03
+HOLD_ANG = 0.35
 ARM_COMMANDS = ("increment", "absolute_integrated", "absolute", "relative_integrated", "relative")
-
-
-@clone
-def spawn_movable_panel(prim_path, cfg, translation=None, orientation=None):
-    from pxr import UsdPhysics
-
-    from isaaclab.sim.spawners.from_files.from_files import spawn_from_usd_file
-
-    prim = spawn_from_usd_file(prim_path, cfg.usd_path, cfg, translation, orientation)
-    body = UsdPhysics.RigidBodyAPI.Apply(prim)
-    body.CreateKinematicEnabledAttr(True)
-    UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(1.0)
-    return prim
-
-
-def reset_panel(env, env_ids, pos, rot):
-    ids = all_ids(env, env_ids)
-    pose = mechanism_asset(env).data.root_link_pose_w[ids]
-    offset_pos = pose.new_tensor(pos).expand(len(ids), -1)
-    offset_rot = pose.new_tensor(rot).expand(len(ids), -1)
-    pos, rot = math_utils.combine_frame_transforms(
-        pose[:, :3], pose[:, 3:7], offset_pos, offset_rot
-    )
-    pose = torch.cat((pos, rot), dim=-1)
-    panel = env.scene["honeycomb"]
-    panel.write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
-    panel.write_root_velocity_to_sim_index(
-        root_velocity=torch.zeros(len(ids), 6, device=env.device), env_ids=ids
-    )
-
-
-@configclass
-class MechanismCfg:
-    asset_name: str = MISSING
-    joint_name: str = MISSING
-    closed_rad: float = MISSING
-    open_rad: float = MISSING
-    grasp_frame: str = MISSING
-    closed_end_stop: bool = MISSING
-    coupled_joint_name: str | None = None
-    coupled_ratio: float = 0.0
-    coupled_offset: float = 0.0
-    mode: str = MISSING
-    success_tolerance: float = MISSING
-    hold_dist: float = 0.03
-    hold_ang: float = 0.35
-    screw: ScrewJointCouplingCfg | None = None
-
-
-@configclass
-class RobotCfg:
-    name: str = MISSING
-    arm_joint_names: tuple[str, ...] = MISSING
-    hand_joint_names: tuple[str, ...] = MISSING
-    finger_joint_names: tuple[str, ...] = MISSING
-    finger_body_names: tuple[str, str] = MISSING
-    tcp_body: str = MISSING
-    tcp_pos: tuple[float, float, float] = MISSING
-    tcp_rot: tuple[float, float, float, float] = MISSING
-    home: tuple[float, ...] = MISSING
-    actuator_groups: tuple[str, ...] = MISSING
-    implicit: bool = MISSING
-    diagnostic_joint: str = MISSING
-
-
-def mechanism_asset(env):
-    return env.scene[env.cfg.mechanism.asset_name]
-
-
-def mechanism_joint_id(env):
-    task = env.cfg.mechanism
-    return env.scene[task.asset_name].find_joints(task.joint_name)[0][0]
-
-
-def write_mechanism_position(env, env_ids, angle, rate=None):
-    task = env.cfg.mechanism
-    mechanism = mechanism_asset(env)
-    rate = torch.zeros_like(angle) if rate is None else rate
-    joints = [mechanism_joint_id(env)]
-    pos, vel = angle[:, None], rate[:, None]
-    if task.coupled_joint_name is not None:
-        joints.append(mechanism.find_joints(task.coupled_joint_name)[0][0])
-        pos = torch.cat((pos, task.coupled_offset + task.coupled_ratio * pos), dim=-1)
-        vel = torch.cat((vel, task.coupled_ratio * vel), dim=-1)
-    mechanism.write_joint_position_to_sim_index(
-        position=pos.contiguous(), joint_ids=joints, env_ids=env_ids
-    )
-    mechanism.write_joint_velocity_to_sim_index(
-        velocity=vel.contiguous(), joint_ids=joints, env_ids=env_ids
-    )
-
-
-def all_ids(env, env_ids):
-    if env_ids is None or isinstance(env_ids, slice):
-        return torch.arange(env.num_envs, device=env.device)
-    return env_ids
-
-
-def sync_coupled_joint(env, env_ids):
-    ids = all_ids(env, env_ids)
-    if env.cfg.mechanism.coupled_joint_name is not None:
-        write_mechanism_position(env, ids, mechanism_position(env)[ids].clone())
 
 
 def mechanism_rate(env):
@@ -169,17 +47,8 @@ def mechanism_rate(env):
 
 
 def _progress_of(env, angle):
-    task = env.cfg.mechanism
-    return (angle - task.closed_rad) / (task.open_rad - task.closed_rad)
-
-
-def _opening_sign(env):
-    task = env.cfg.mechanism
-    return 1.0 if task.open_rad > task.closed_rad else -1.0
-
-
-def _is_open(env, angle, threshold_rad):
-    return _opening_sign(env) * (env.cfg.mechanism.open_rad - angle) <= threshold_rad
+    task = env.cfg.task
+    return (angle - task.start) / (task.target - task.start)
 
 
 class IntegratedJointPositionAction(JointAction):
@@ -248,24 +117,6 @@ class IntegratedJointPositionActionCfg(JointActionCfg):
     command: str = "increment"
 
 
-def silence_solver_overflow_warnings(env, env_ids):
-    NewtonManager._solver.mjw_model.opt.warn_overflow = False
-
-
-def reset_joints_from_postures(env, env_ids, postures, position_range, asset_cfg):
-    asset = env.scene[asset_cfg.name]
-    ids = all_ids(env, env_ids)
-    table = torch.tensor(list(postures.values()), device=env.device)
-    pick = torch.randint(len(table), (len(ids),), device=env.device)
-    noise = torch.empty(len(ids), table.shape[1], device=env.device).uniform_(*position_range)
-    limits = asset.data.joint_pos_limits.torch[ids][:, asset_cfg.joint_ids]
-    q = (table[pick] + noise).clamp(min=limits[..., 0], max=limits[..., 1])
-    asset.write_joint_position_to_sim_index(position=q, joint_ids=asset_cfg.joint_ids, env_ids=ids)
-    asset.write_joint_velocity_to_sim_index(
-        velocity=torch.zeros_like(q), joint_ids=asset_cfg.joint_ids, env_ids=ids
-    )
-
-
 def _body_frame_w(env, asset_name, body_name, offset_pos, offset_rot):
     asset = env.scene[asset_name]
     body = asset.find_bodies(body_name)[0][0]
@@ -276,13 +127,13 @@ def _body_frame_w(env, asset_name, body_name, offset_pos, offset_rot):
 
 
 def grasp_target_w(env):
-    task = env.cfg.mechanism
+    asset = env.cfg.task.asset
     frame_cfg = next(
-        f for f in env.scene.cfg.target_frame.target_frames if f.name == task.grasp_frame
+        f for f in env.scene.cfg.target_frame.target_frames if f.name == asset.grasp_frame
     )
     body = frame_cfg.prim_path.rsplit("/", 1)[-1]
     goal_pos, goal_quat = _body_frame_w(
-        env, task.asset_name, body, frame_cfg.offset.pos, frame_cfg.offset.rot
+        env, asset.name, body, frame_cfg.offset.pos, frame_cfg.offset.rot
     )
     flip = goal_quat.new_tensor([1.0, 0.0, 0.0, 0.0]).expand_as(goal_quat)
     flipped = math_utils.quat_mul(goal_quat, flip)
@@ -293,8 +144,8 @@ def grasp_target_w(env):
 
 
 def tcp_w(env):
-    cfg = env.cfg.robot
-    return _body_frame_w(env, "robot", cfg.tcp_body, cfg.tcp_pos, cfg.tcp_rot)
+    ee = env.cfg.robot.ee
+    return _body_frame_w(env, "robot", ee.body_name, ee.tcp_offset.pos, ee.tcp_offset.rot)
 
 
 def tcp_grasp_error(env):
@@ -302,10 +153,6 @@ def tcp_grasp_error(env):
     goal_pos, goal_quat = grasp_target_w(env)
     dist = torch.norm(tcp_pos - goal_pos, dim=-1)
     return dist, math_utils.quat_error_magnitude(tcp_quat, goal_quat)
-
-
-def mechanism_position(env):
-    return mechanism_asset(env).data.joint_pos.torch[:, mechanism_joint_id(env)]
 
 
 def mechanism_progress(env):
@@ -363,7 +210,7 @@ def pad_force(env, sensor_names=("finger_contact", "jaw_contact")):
 
 def pad_force_split(env, sensor_names=("finger_contact", "jaw_contact")):
     robot = env.scene["robot"]
-    left, right = (robot.find_bodies(name)[0][0] for name in env.cfg.robot.finger_body_names)
+    left, right = (robot.find_bodies(p.rsplit("/", 1)[-1])[0][0] for p in env.cfg.robot.pads)
     axis = robot.data.body_pos_w.torch[:, right] - robot.data.body_pos_w.torch[:, left]
     axis = axis / axis.norm(dim=-1, keepdim=True).clamp(min=1.0e-6)
     squeeze, lateral = [], []
@@ -422,14 +269,14 @@ class registered_mechanism_b(ManagerTermBase):
 
 
 def held(env):
-    task = env.cfg.mechanism
-    if task.mode != "grasp":
+    mode = env.cfg.task.asset.mode
+    if mode != "grasp":
         touching = pad_force(env) > CONTACT_FORCE_N
-        if task.mode == "push":
+        if mode == "push":
             return touching.any(dim=-1)
         return touching.all(dim=-1) & _gripper_closed(env).bool()
     dist, ang = tcp_grasp_error(env)
-    return (dist < task.hold_dist) & (ang < task.hold_ang) & _gripper_closed(env).bool()
+    return (dist < HOLD_DIST) & (ang < HOLD_ANG) & _gripper_closed(env).bool()
 
 
 def pad_force_excess(env, max_force):
@@ -437,12 +284,13 @@ def pad_force_excess(env, max_force):
 
 
 def succeeded(env):
-    return _is_open(env, mechanism_position(env), env.cfg.mechanism.success_tolerance)
+    task = env.cfg.task
+    return board.opening_sign(env) * (task.target - mechanism_position(env)) <= task.tolerance
 
 
 def released_and_clear(env, min_distance=0.06, max_force=1.0):
     dist, _ = tcp_grasp_error(env)
-    if env.cfg.mechanism.mode == "push":
+    if env.cfg.task.asset.mode == "push":
         let_go = torch.ones_like(dist, dtype=torch.bool)
     else:
         let_go = _gripper_closed(env) == 0.0
@@ -455,7 +303,7 @@ def released_and_clear(env, min_distance=0.06, max_force=1.0):
 
 
 def opening_credited(env, held, ever_held):
-    return ever_held if env.cfg.mechanism.mode == "push" else held
+    return ever_held if env.cfg.task.asset.mode == "push" else held
 
 
 def invalid_state(env, asset_cfg, max_joint_vel):
@@ -480,10 +328,6 @@ class ReferenceCommand(CommandTerm):
     def command(self):
         return torch.stack((self.rate, _progress_of(self._env, self.ref_angle)), dim=-1)
 
-    @property
-    def reference_done(self):
-        return _is_open(self._env, self.ref_angle, 1.0e-6)
-
     def _update_metrics(self):
         self.metrics["tracking_error_rad"] = (mechanism_position(self._env) - self.ref_angle).abs()
 
@@ -500,12 +344,12 @@ class ReferenceCommand(CommandTerm):
         self.engaged |= held(self._env)
         self.engaged_time += self._env.step_dt * self.engaged.float()
         moving = self.engaged_time > self.cfg.engage_delay_s
-        sign = _opening_sign(self._env)
+        sign = board.opening_sign(self._env)
         self.ref_angle += sign * self.rate * self._env.step_dt * moving.float()
         if sign < 0:
-            self.ref_angle.clamp_(min=self._env.cfg.mechanism.open_rad)
+            self.ref_angle.clamp_(min=self._env.cfg.task.target)
         else:
-            self.ref_angle.clamp_(max=self._env.cfg.mechanism.open_rad)
+            self.ref_angle.clamp_(max=self._env.cfg.task.target)
 
 
 @configclass
@@ -531,101 +375,8 @@ def rate_excess(env, factor):
     return (mechanism_rate(env).abs() - limit).clamp(min=0.0).square()
 
 
-class randomize_dynamics(ManagerTermBase):
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
-        task = env.cfg.mechanism
-        ranges = cfg.params["ranges"]
-        assert task.closed_end_stop or (
-            ranges["spring"][1] == ranges["breakaway"][1] == cfg.params["stuck_prob"] == 0.0
-        ), f"'{task.asset_name}' has no end stop at closed for a spring or seat torque"
-        self.mechanism = env.scene[task.asset_name]
-        self.joint_ids = self.mechanism.find_joints(task.joint_name)[0]
-        self.closed_rad = task.closed_rad
-        self.params = torch.zeros(env.num_envs, len(DYNAMICS), device=env.device)
-        stuck_breakaway = cfg.params["stuck_breakaway"]
-        scale = [
-            max(ranges[name][1], stuck_breakaway[1] if name == "breakaway" else 0.0) or 1.0
-            for name in DYNAMICS
-        ]
-        self.scale = torch.tensor(scale, device=env.device)
-        env.dynamics_term = self
-
-    def __call__(self, env, env_ids, ranges, stuck_prob, stuck_breakaway):
-        ids = all_ids(env, env_ids)
-        values = torch.empty(len(ids), len(DYNAMICS), device=env.device)
-        for i, name in enumerate(DYNAMICS):
-            values[:, i].uniform_(*ranges[name])
-        values[:, 2] = torch.minimum(values[:, 2], values[:, 0] / SPRING_STATIC_RAD)
-        stuck = torch.rand(len(ids), device=env.device) < stuck_prob
-        if stuck.any():
-            n = int(stuck.sum())
-            values[stuck, 3] = torch.empty(n, device=env.device).uniform_(*stuck_breakaway)
-            closed = torch.full((n, 1), self.closed_rad, device=env.device)
-            self.mechanism.write_joint_position_to_sim_index(
-                position=closed, joint_ids=self.joint_ids, env_ids=ids[stuck]
-            )
-            self.mechanism.write_joint_velocity_to_sim_index(
-                velocity=torch.zeros_like(closed), joint_ids=self.joint_ids, env_ids=ids[stuck]
-            )
-        self.write(ids, values)
-
-    def write(self, env_ids, values):
-        self.params[env_ids] = values
-        self.mechanism.write_joint_friction_coefficient_to_sim_index(
-            joint_friction_coeff=values[:, 0:1].contiguous(),
-            joint_viscous_friction_coeff=values[:, 1:2].contiguous(),
-            joint_ids=self.joint_ids,
-            env_ids=env_ids,
-        )
-        self.mechanism.write_joint_armature_to_sim_index(
-            armature=values[:, 4:5].contiguous(), joint_ids=self.joint_ids, env_ids=env_ids
-        )
-
-
 def dynamics_obs(env):
     return env.dynamics_term.params / env.dynamics_term.scale
-
-
-class LoadAction(ActionTerm):
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
-        task = env.cfg.mechanism
-        assert task.asset_name == cfg.asset_name, (cfg.asset_name, task.asset_name)
-        self._joint_ids = self._asset.find_joints(task.joint_name)[0]
-        self._closed_rad = task.closed_rad
-        self._opening_sign = _opening_sign(env)
-        self._empty = torch.zeros(self.num_envs, 0, device=self.device)
-
-    @property
-    def action_dim(self):
-        return 0
-
-    @property
-    def raw_actions(self):
-        return self._empty
-
-    @property
-    def processed_actions(self):
-        return self._empty
-
-    def process_actions(self, actions):
-        pass
-
-    def apply_actions(self):
-        term = self._env.dynamics_term
-        angle = self._asset.data.joint_pos.torch[:, self._joint_ids[0]]
-        spring, breakaway, sign = term.params[:, 2], term.params[:, 3], self._opening_sign
-        opening = (sign * (angle - self._closed_rad)).clamp(min=0.0)
-        width = (1.0 - opening / BREAKAWAY_WIDTH_RAD).clamp(min=0.0)
-        torque = -sign * (spring * opening + breakaway * width)
-        self._asset.set_joint_effort_target_index(target=torque[:, None], joint_ids=self._joint_ids)
-
-
-@configclass
-class LoadActionCfg(ActionTermCfg):
-    class_type: type = LoadAction
-    asset_name: str = MISSING
 
 
 def delayed_actuators(robot, groups, max_delay_s, physics_dt):
@@ -701,7 +452,7 @@ class ExpertBank:
         self.arm_q0 = bank["arm_q0"].float()
         self.position0 = bank["mechanism_position0"].float()
         self.pose_env = bank["mechanism_pose_env"].float()
-        assert list(meta["dynamics"]) == list(DYNAMICS), path
+        assert list(meta["dynamics"]) == list(board.DYNAMICS), path
         self.dynamics = bank["dynamics"].float()
         column = list(meta["expert_diversity"]).index("turn_rate")
         self.turn_rate = bank["expert_diversity"][:, column].float()
@@ -716,14 +467,8 @@ class ExpertBank:
     def mechanism_reference(self, idx, step):
         return self.position[idx, self._bank_step(idx, step)]
 
-    def gripper_reference(self, idx, step):
-        return self.gripper_q[idx, self._bank_step(idx, step)]
-
     def gripper_closed_reference(self, idx, step):
         return self.gripper_closed[idx, self._bank_step(idx, step)]
-
-    def contact_reference(self, idx, step):
-        return self.contact[idx, self._bank_step(idx, step)]
 
     def joint_reference(self, idx, step):
         reach = self.reach[idx, step.clamp(max=self.reach.shape[1] - 1)]
@@ -753,7 +498,6 @@ class reset_from_expert_bank(ManagerTermBase):
         self._hand_ids = robot.find_joints(hand, preserve_order=True)[0]
         self._arm_ids = robot.find_joints(arm, preserve_order=True)[0]
         self._finger_id = robot.find_joints(env.cfg.actions.gripper_action.joint_names)[0][0]
-        self._mechanism_name = env.cfg.mechanism.asset_name
         env.expert_bank_term = self
         print(f"[INFO] Expert bank: {self.bank.size} trajectories from {cfg.params['path']}")
 
@@ -762,11 +506,12 @@ class reset_from_expert_bank(ManagerTermBase):
         if standard:
             self.index[ids] = 0
             self.start_step[ids] = 0
-            home = torch.tensor(self.robot.home, device=env.device).expand(len(ids), -1)
+            home = torch.tensor(self.robot.postures["home"], device=env.device)
+            home = home.expand(len(ids), -1)
             env.scene["robot"].write_joint_position_to_sim_index(
                 position=home, joint_ids=self._arm_ids, env_ids=ids
             )
-            closed = torch.full((len(ids),), env.cfg.mechanism.closed_rad, device=env.device)
+            closed = torch.full((len(ids),), env.cfg.task.start, device=env.device)
             write_mechanism_position(env, ids, closed)
             return
         draw = torch.randint(0, self.bank.size, (len(ids),), device=env.device)
@@ -782,7 +527,7 @@ class reset_from_expert_bank(ManagerTermBase):
         self.index[ids] = draw
         self.start_step[ids] = 0
         robot = env.scene["robot"]
-        mechanism = env.scene[self._mechanism_name]
+        mechanism = mechanism_asset(env)
         pose = self.bank.pose_env[draw].clone()
         pose[:, :3] += env.scene.env_origins[ids]
         mechanism.write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
@@ -900,14 +645,16 @@ def expert_gripper_reference(env, follow_release, follow_reach):
 def track_expert_gripper(env, std):
     term = env.expert_bank_term
     finger = env.scene["robot"].data.joint_pos.torch[:, term._finger_id]
-    error = finger - term.bank.gripper_reference(term.index, reference_step(env))
+    step = term.bank._bank_step(term.index, reference_step(env))
+    error = finger - term.bank.gripper_q[term.index, step]
     return torch.exp(-error.square() / std**2)
 
 
 def track_expert_contact(env):
     term = env.expert_bank_term
     policy = (pad_force(env) > CONTACT_FORCE_N).float()
-    expert = term.bank.contact_reference(term.index, reference_step(env))
+    step = term.bank._bank_step(term.index, reference_step(env))
+    expert = term.bank.contact[term.index, step]
     return (policy == expert).float().mean(dim=-1)
 
 
@@ -1009,16 +756,8 @@ class TargetDelay(ManagerTermBase):
 
 
 @configclass
-class PhysicsCfg(PresetCfg):
-    newton_mjwarp = NewtonCfg(solver_cfg=MJWarpSolverCfg())
-    default = newton_mjwarp
-
-
-@configclass
-class ActionsCfg:
+class ActionsCfg(board.ActionsCfg):
     arm_action = IntegratedJointPositionActionCfg(asset_name="robot", preserve_order=True)
-    gripper_action = RateLimitedBinaryJointPositionActionCfg(asset_name="robot")
-    load = LoadActionCfg()
 
 
 @configclass
@@ -1063,26 +802,18 @@ class ObservationsCfg:
 
 @configclass
 class EventCfg:
-    quiet_solver = EventTerm(func=silence_solver_overflow_warnings, mode="startup")
-    robot_gravcomp = EventTerm(
-        func=apply_articulation_gravcomp,
-        mode="startup",
-        params={"asset_cfg": SceneEntityCfg("robot")},
-    )
-    mechanism_gravcomp = EventTerm(func=apply_articulation_gravcomp, mode="startup")
-    robot_physics_material = EventTerm(func=base_mdp.randomize_rigid_body_material, mode="startup")
-    mechanism_physics_material = EventTerm(
-        func=base_mdp.randomize_rigid_body_material, mode="startup"
-    )
-    contacts = EventTerm(func=set_contact_stiffness, mode="startup")
-    reset_all = EventTerm(
-        func=base_mdp.reset_scene_to_default, mode="reset", params={"reset_joint_targets": True}
-    )
+    quiet_solver = None
+    robot_gravcomp = None
+    mechanism_gravcomp = None
+    robot_physics_material = None
+    mechanism_physics_material = None
+    contacts = None
+    reset_all = None
     arm_delay = None
     reset_mechanism_root = None
     reset_mechanism_joint = None
     reset_arm = None
-    dynamics = EventTerm(func=randomize_dynamics, mode="reset")
+    dynamics = None
     reset_from_bank = EventTerm(func=reset_from_expert_bank, mode="reset")
     reset_panel = None
     end_stops = None
@@ -1090,7 +821,7 @@ class EventCfg:
 
 
 @configclass
-class CommandsCfg:
+class CommandsCfg(board.CommandsCfg):
     reference = ReferenceCommandCfg()
 
 
@@ -1119,18 +850,13 @@ class TerminationsCfg:
 
 
 @configclass
-class EnvCfg(ManagerBasedRLEnvCfg):
-    task: str = MISSING
-    robot: RobotCfg = MISSING
-    mechanism: MechanismCfg = MISSING
+class EnvCfg(board.HiveBoardEnvCfg):
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     events: EventCfg = EventCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     commands: CommandsCfg = CommandsCfg()
-    sim: SimulationCfg = SimulationCfg(physics=PhysicsCfg())
-    viewer: ViewerCfg = ViewerCfg()
 
 
 def load(name):
@@ -1156,223 +882,27 @@ def bank_path(robot, task):
     return os.path.join(REPO_ROOT, "logs", "expert_bank", f"{robot}_{task}.pt")
 
 
-def as_pose(pos, rot):
-    return torch.tensor([pos], dtype=torch.float64), torch.tensor([rot], dtype=torch.float64)
-
-
 def compose(robot_name, task_name, mode):
-    robot, task = load(f"robots/{robot_name}"), load(f"tasks/{task_name}")
-    asset = load(f"assets/{task['asset']}")
+    robot = load(f"robots/{robot_name}")
     layers = (load("train"), robot)
-    ee = get_object(robot["ee"])
-    offset = ee.tcp_offset
-    name = task["asset"]
-    mechanism = asset["mechanism"]
-    interaction = asset["interaction"].copy()
-    grip_effort_scale = interaction.pop("grip_effort_scale", 1.0)
-    physics = {
-        "asset_name": name,
-        "joint_name": "RevoluteJoint",
-        "closed_end_stop": mechanism["closed_end_stop"],
-    }
-    screw = None
-    if "screw" in asset:
-        coupling = asset["screw"].copy()
-        axial_reference = coupling.pop("axial_reference")
-        screw = ScrewJointCouplingCfg(
-            asset_name=name,
-            **coupling,
-            viscous_friction=0.0,
-            coulomb_friction=0.0,
-            stiction=0.0,
-            end_stop_base_damping=0.0,
-            end_stop_scale=0.0,
-            end_stop_activation_distance=0.0005,
-            use_native_mimic_constraint=True,
-        )
-        physics.update(
-            joint_name=screw.revolute_joint_name,
-            coupled_joint_name=screw.prismatic_joint_name,
-            coupled_ratio=screw.pitch_m_per_revolution / math.tau,
-            coupled_offset=axial_reference,
-        )
-    cfg = EnvCfg(
-        task=task_name,
-        robot=RobotCfg(
-            **robot["robot"],
-            name=robot_name,
-            home=robot["postures"]["home"],
-            actuator_groups=robot["actuator_groups"],
-            finger_body_names=[pad.rsplit("/", 1)[-1] for pad in robot["pads"]],
-            tcp_body=ee.body_name,
-            tcp_pos=offset.pos,
-            tcp_rot=offset.rot,
-        ),
-        mechanism=MechanismCfg(
-            **physics,
-            **interaction,
-            closed_rad=task["goal"]["start"],
-            open_rad=task["goal"]["target"],
-            success_tolerance=task["goal"]["tolerance"],
-            screw=screw,
-        ),
-        scene=InteractiveSceneCfg(num_envs=1, env_spacing=2.5),
-        episode_length_s=task["episode_length_s"],
-    )
-    scene = cfg.scene
-    scene.ground = AssetBaseCfg(
-        prim_path="/World/Ground",
-        collision_group=-1,
-        spawn=sim_utils.CuboidCfg(
-            size=(20.0, 20.0, 0.1),
-            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
-        ),
-        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -0.05)),
-    )
-    scene.light = AssetBaseCfg(
-        prim_path="/World/light",
-        spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
-    )
-    setattr(
-        scene,
-        physics["asset_name"],
-        ArticulationCfg(
-            prim_path="{ENV_REGEX_NS}/" + asset["prim"],
-            spawn=sim_utils.UsdFileCfg(
-                usd_path=get_object("isaaclab_hiveboard.assets." + asset["usd"]),
-                activate_contact_sensors=True,
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    disable_gravity=True,
-                    retain_accelerations=False,
-                    linear_damping=0.0,
-                    angular_damping=0.0,
-                    max_linear_velocity=1000.0,
-                    max_angular_velocity=1000.0,
-                    max_depenetration_velocity=1.0,
-                ),
-                articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                    enabled_self_collisions=False
-                ),
-            ),
-            init_state=ArticulationCfg.InitialStateCfg(
-                **asset["mounting"],
-                joint_pos={
-                    joint: (
-                        physics["coupled_offset"]
-                        if screw and joint == screw.prismatic_joint_name
-                        else task["goal"]["start"]
-                        if joint == physics["joint_name"]
-                        else 0.0
-                    )
-                    for joint in mechanism["joints"]
-                },
-                joint_vel={".*": 0.0},
-            ),
-            actuators={
-                joint: ImplicitActuatorCfg(
-                    joint_names_expr=[joint],
-                    **{
-                        "stiffness": 0.0,
-                        "damping": 0.0,
-                        "effort_limit_sim": 2.0,
-                        **values,
-                    },
-                )
-                for joint, values in mechanism["joints"].items()
-            },
-        ),
-    )
-    panel = asset["panel"]
-    scene.honeycomb = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Honeycomb",
-        collision_group=-1,
-        spawn=sim_utils.UsdFileCfg(
-            func=spawn_movable_panel,
-            usd_path=get_object("isaaclab_hiveboard.assets.HONEYCOMB_USD"),
-            scale=(0.001, 0.001, 0.001),
-            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-        ),
-    )
-    frames = asset["frames"]
-    frame_path = "{ENV_REGEX_NS}/" + asset["prim"] + "/" + frames["path"]
-    scene.target_frame = FrameTransformerCfg(
-        prim_path=frame_path,
-        debug_vis=False,
-        target_frames=[
-            FrameTransformerCfg.FrameCfg(
-                prim_path=frame_path,
-                name=frame,
-                offset=OffsetCfg(pos=value["pos"], rot=value.get("rot", frames["rot"])),
-            )
-            for frame, value in frames["targets"].items()
-        ],
-    )
-    cfg.events.dynamics.params = {
-        "ranges": {key: [0.0, 0.0] for key in DYNAMICS},
-        "stuck_prob": 0.0,
-        "stuck_breakaway": [0.0, 0.0],
-    }
-    scene, name = cfg.scene, cfg.mechanism.asset_name
-    scene.robot = get_object(robot["articulation"]).replace(prim_path="{ENV_REGEX_NS}/Robot")
-    scene.ee_frame = make_ee_frame(ee)
-    for sensor, pad in zip(("finger_contact", "jaw_contact"), robot["pads"]):
-        contact = ContactSensorCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/" + pad,
-            update_period=0.0,
-            history_length=1,
-            filter_prim_paths_expr=["{ENV_REGEX_NS}/" + asset["prim"] + "/.*"],
-        )
-        setattr(scene, sensor, contact)
-    state = getattr(scene, name).init_state
-    pos, rot = math_utils.combine_frame_transforms(
-        *as_pose(robot["board"]["pos"], robot["board"]["rot"]), *as_pose(state.pos, state.rot)
-    )
-    state.pos, state.rot = tuple(pos[0].tolist()), tuple(rot[0].tolist())
-    pos, rot = math_utils.combine_frame_transforms(pos, rot, *as_pose(panel["pos"], panel["rot"]))
-    scene.honeycomb.init_state = RigidObjectCfg.InitialStateCfg(
-        pos=tuple(pos[0].tolist()), rot=tuple(rot[0].tolist())
-    )
-    cfg.events.reset_panel = EventTerm(func=reset_panel, mode="reset", params=panel)
-    if cfg.mechanism.screw:
-        register_screw_joint_mimic(
-            cfg.mechanism.screw,
-            revolute_pos_at_reset=cfg.mechanism.closed_rad,
-            prismatic_pos_at_reset=cfg.mechanism.coupled_offset,
-        )
+    cfg = board.build(EnvCfg(), robot_name, task_name)
     for layer in layers:
         merge(cfg, layer.get("env", {}))
-    physical = asset["physics"]
-    merge(cfg.events.dynamics.params, physical["dynamics"])
-    for material in ("robot", "mechanism"):
-        merge(
-            getattr(cfg.events, material + "_physics_material").params,
-            physical.get(material + "_material", {}),
-        )
-    for solver in (cfg.sim.physics.newton_mjwarp, cfg.sim.physics.default):
-        merge(solver.solver_cfg, physical.get("solver", {}))
-    merge(cfg.viewer, {"asset_name": name, **asset.get("viewer", {})})
-    if "end_stop_damping" in mechanism:
-        cfg.events.end_stops = EventTerm(
-            func=set_joint_limit_damping,
-            mode="startup",
-            params={
-                "asset_cfg": SceneEntityCfg(name, joint_names=[physics["joint_name"]]),
-                "kd": mechanism["end_stop_damping"],
-            },
-        )
-    if cfg.mechanism.mode == "contact_grasp":
-        cfg.observations.teacher.expert_gripper.params["follow_release"] = True
+    asset = cfg.task.asset
+    merge(cfg.viewer, {"asset_name": asset.name, **asset.viewer})
+    obs, events = cfg.observations, cfg.events
+    if asset.mode == "contact_grasp":
+        obs.teacher.expert_gripper.params["follow_release"] = True
         cfg.terminations.expert_drift.params["max_error"] = 0.5
         cfg.terminations.expert_mechanism_lag.params["max_error"] = 0.5
-    elif cfg.mechanism.mode == "push":
-        cfg.observations.teacher.expert_gripper.params["follow_reach"] = True
+    elif asset.mode == "push":
+        obs.teacher.expert_gripper.params["follow_reach"] = True
         cfg.rewards.overspeed = None
         cfg.terminations.expert_mechanism_lag.params["max_error"] = 0.6
     arm = SceneEntityCfg("robot", joint_names=list(cfg.robot.arm_joint_names), preserve_order=True)
     hand = SceneEntityCfg(
         "robot", joint_names=list(cfg.robot.finger_joint_names), preserve_order=True
     )
-    obs, events = cfg.observations, cfg.events
     for term in (
         obs.policy.arm_joint_pos,
         obs.teacher.arm_joint_pos,
@@ -1383,23 +913,9 @@ def compose(robot_name, task_name, mode):
         term.params["asset_cfg"] = arm
     for term in (obs.policy.gripper_pos, obs.teacher.gripper_pos, obs.policy.gripper_object):
         term.params["asset_cfg"] = hand
-    cfg.actions.arm_action.joint_names = list(cfg.robot.arm_joint_names)
-    cfg.actions.load.asset_name = name
-    events.robot_physics_material.params["asset_cfg"] = SceneEntityCfg(
-        "robot", body_names=list(cfg.robot.finger_body_names)
-    )
-    events.mechanism_gravcomp.params["asset_cfg"] = SceneEntityCfg(name)
-    events.mechanism_physics_material.params["asset_cfg"] = SceneEntityCfg(name)
-    events.contacts.params["shape_regex"] = f"{robot['contact_shapes']}|/{asset['prim']}/"
     events.reset_from_bank.params.update(path=bank_path(robot_name, task_name), task=task_name)
-    actuators = dict(scene.robot.actuators)
-    for group, effort in robot["grip_effort"].items():
-        actuators[group] = actuators[group].replace(effort_limit=effort * grip_effort_scale)
-    scene.robot = delayed_actuators(
-        scene.robot.replace(actuators=actuators),
-        robot["delayed_groups"],
-        robot["delay_s"],
-        cfg.sim.dt,
+    cfg.scene.robot = delayed_actuators(
+        cfg.scene.robot, robot["delayed_groups"], robot["delay_s"], cfg.sim.dt
     )
     for layer in layers:
         merge(cfg, layer.get(mode, {}))

@@ -1,23 +1,5 @@
 env:
   scene: {num_envs: 1024, env_spacing: 3.0}
-  sim:
-    physics:
-      newton_mjwarp: &physics
-        solver_cfg:
-          solver: newton
-          integrator: implicitfast
-          cone: elliptic
-          njmax: 600
-          nconmax: 300
-          iterations: 100
-          ls_iterations: 20
-          impratio: 10.0
-          ccd_iterations: 50
-          use_mujoco_contacts: false
-        num_substeps: 2
-        debug_mode: false
-        use_cuda_graph: false
-      default: *physics
   actions:
     arm_action: {scale: 0.1}
   observations:
@@ -34,22 +16,6 @@ env:
       expert_gripper: {params: {follow_release: false, follow_reach: false}}
       expert_mechanism_error: {scale: 5.0}
   events:
-    robot_gravcomp: {params: {gravcomp: 1.0}}
-    mechanism_gravcomp: {params: {gravcomp: 1.0}}
-    robot_physics_material:
-      params:
-        static_friction_range: [0.3, 0.6]
-        dynamic_friction_range: [0.3, 0.5]
-        restitution_range: [0.0, 0.0]
-        num_buckets: 16
-    mechanism_physics_material:
-      params:
-        static_friction_range: [0.2, 1.0]
-        dynamic_friction_range: [0.2, 0.8]
-        restitution_range: [0.0, 0.0]
-        num_buckets: 16
-        make_consistent: true
-    contacts: {params: {ke: 40000.0, kd: 400.0, solimp: [0.95, 0.99, 0.001]}}
     reset_from_bank: {params: {mid_start_prob: 0.5, standard: false}}
   commands:
     reference: {rate_range: [0.3, 0.3], engage_delay_s: 0.0}

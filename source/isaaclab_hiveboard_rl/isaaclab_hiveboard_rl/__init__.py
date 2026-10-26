@@ -9,9 +9,9 @@ def camel(name):
     return "".join(word.capitalize() for word in name.split("_"))
 
 
-for robot in sorted(os.listdir(os.path.join(env.REPO_ROOT, "configs", "robots"))):
-    for task in sorted(os.listdir(os.path.join(env.REPO_ROOT, "configs", "tasks"))):
-        robot, task = robot.removesuffix(".yaml"), task.removesuffix(".yaml")
+robots = os.listdir(os.path.join(env.REPO_ROOT, "configs", "robots"))
+for robot in sorted(name.removesuffix(".yaml") for name in robots):
+    for task in sorted(env.board.TASKS):
         for mode, suffix in (("train", ""), ("play", "-Play")):
             gym.register(
                 id=f"Isaac-HiveBoard-{camel(robot)}-{camel(task)}-RL{suffix}-v0",
