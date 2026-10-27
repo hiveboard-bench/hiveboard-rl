@@ -13,17 +13,17 @@ just bc path/to/demos.pt
 just all
 ```
 
-Select a pair with `RL_ROBOT=anymal RL_TASK=open_ball_valve`. Every robot with a
+Select a pair with `RL_ROBOT=anymal RL_TASK=open_ball_valve_simple`. Every robot with a
 `configs/robots/<robot>.yaml` is registered with every core task. Registration does not imply
 expert success. `just all` banks each pair and only trains pairs whose expert success reaches
 0.8. `just test` runs the full disposable pipeline.
 
-## Split
+## Structure
 
-The benchmark lives in `dependencies/isaaclab-hiveboard`. Its
-`isaaclab_hiveboard/tasks.py` holds robots, assets and tasks as Isaac Lab configclasses,
-`HiveBoardEnvCfg`, `build()` for the scene, physics and actions, and `expert()` for the
-scripted demonstrator. This repository adds learning only.
+The benchmark comes from `dependencies/isaaclab-hiveboard`. Its
+`isaaclab_hiveboard/tasks_simple.py` holds robots, assets and single-goal tasks as Isaac Lab
+configclasses, `HiveBoardEnvCfg`, `build()` for the scene, physics and actions, and `expert()`
+for the scripted demonstrator. This repository adds learning only.
 
 | File | Owns |
 |---|---|

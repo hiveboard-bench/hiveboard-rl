@@ -2,7 +2,7 @@
 
 ## Core and RL split
 
-- [x] robots, assets and tasks as core configclasses in `isaaclab_hiveboard/tasks.py`
+- [x] robots, assets and tasks as core configclasses in `isaaclab_hiveboard/tasks_simple.py`
 - [x] core `HiveBoardEnvCfg`, `build()` and `expert()`; RL `EnvCfg` adds the MDP only
 - [x] RL YAML holds learning knobs only, train plus one file per robot
 - [x] core per-robot task tree, scenes, JSON setups, editors and probes deleted

@@ -25,9 +25,15 @@ from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
 REVERSAL_RATE = 0.05
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--task", default="Isaac-HiveBoard-Anymal-OpenBallValve-RL-Play-v0")
+parser.add_argument(
+    "--task", default="Isaac-HiveBoard-Anymal-OpenBallValveSimple-RL-Play-v0",
+    help="registered Gym task ID; Simple tasks use simplified single-goal protocols",
+)
 parser.add_argument("--checkpoint")
-parser.add_argument("--policy", choices=("checkpoint", "expert"), default="checkpoint")
+parser.add_argument(
+    "--policy", choices=("checkpoint", "expert"), default="checkpoint",
+    help="expert replays a saved bank; bank.py runs the live scripted expert",
+)
 parser.add_argument("--save", help="record expert demos to this file")
 parser.add_argument("--command", choices=mdp.ARM_COMMANDS, default="increment")
 parser.add_argument("--keep_failed", action="store_true")

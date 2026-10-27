@@ -17,7 +17,10 @@ from isaaclab_hiveboard.mdp.commands.sequential_pose_command import PHASES
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--robot", default="anymal")
-parser.add_argument("--task", default="open_ball_valve")
+parser.add_argument(
+    "--task", default="open_ball_valve_simple",
+    help="simplified single-goal task from core tasks_simple.TASKS",
+)
 parser.add_argument("--num_envs", type=int, default=512)
 parser.add_argument("--num_trajectories", type=int, default=5000)
 parser.add_argument("--max_waves", type=int, default=50)
@@ -86,6 +89,9 @@ with launch_simulation(env_cfg, args):
     env = ManagerBasedRLEnv(cfg=env_cfg)
     dev, n_envs = env.device, env.num_envs
     robot, mechanism = env.scene["robot"], mdp.mechanism_asset(env)
+    manipuland = (
+        env.scene["manipuland"] if env_cfg.task.asset.manipuland_usd is not None else None
+    )
     arm_ids = robot.find_joints(env_cfg.actions.arm_action.joint_names, preserve_order=True)[0]
     grip_id = robot.find_joints(env_cfg.actions.gripper_action.joint_names)[0][0]
     hand_ids, hand_names = robot.find_joints(list(profile.hand_joint_names), preserve_order=True)
@@ -139,6 +145,11 @@ with launch_simulation(env_cfg, args):
             "dynamics": env.dynamics_term.params.clone(),
             "expert_diversity": env.expert_diversity_term.values.clone(),
         }
+        if manipuland is not None:
+            pose = manipuland.data.root_pose_w.torch.clone()
+            pose[:, :3] -= env.scene.env_origins
+            init["manipuland_pose_env0"] = pose
+            init["manipuland_velocity0"] = manipuland.data.root_vel_w.torch.clone()
         steps = {
             k: []
             for k in (
@@ -154,6 +165,10 @@ with launch_simulation(env_cfg, args):
                 "gripper_joint_pos",
             )
         }
+        if manipuland is not None:
+            steps.update(manipuland_pose_env=[], manipuland_velocity=[])
+        if not env_cfg.task.persistent_goal:
+            steps["goal_reached"] = []
         opened_held = torch.zeros(n_envs, dtype=torch.bool, device=dev)
         ever_held = torch.zeros(n_envs, dtype=torch.bool, device=dev)
         opened_any = torch.zeros(n_envs, dtype=torch.bool, device=dev)
@@ -171,6 +186,22 @@ with launch_simulation(env_cfg, args):
                     euler = (torch.rand(n_envs, 3, device=dev) * 2 - 1) * args.reg_bias_rot
                     delta = math_utils.quat_from_euler_xyz(euler[:, 0], euler[:, 1], euler[:, 2])
                     pose[:, 3:] = math_utils.quat_mul(delta, pose[:, 3:])
+                    if manipuland is not None:
+                        relative = math_utils.subtract_frame_transforms(
+                            mechanism.data.root_pos_w.torch,
+                            mechanism.data.root_quat_w.torch,
+                            manipuland.data.root_pos_w.torch,
+                            manipuland.data.root_quat_w.torch,
+                        )
+                        body_pose = math_utils.combine_frame_transforms(
+                            pose[:, :3], pose[:, 3:], *relative
+                        )
+                        manipuland.write_root_pose_to_sim_index(
+                            root_pose=torch.cat(body_pose, dim=-1)
+                        )
+                        manipuland.write_root_velocity_to_sim_index(
+                            root_velocity=torch.zeros(n_envs, 6, device=dev)
+                        )
                     mechanism.write_root_pose_to_sim_index(root_pose=pose)
                     mechanism.write_root_velocity_to_sim_index(
                         root_velocity=torch.zeros(n_envs, 6, device=dev)
@@ -194,6 +225,15 @@ with launch_simulation(env_cfg, args):
                 steps["phase_id"].append(command.phase.clone())
                 steps["pad_force"].append(mdp.pad_force(env).clone())
                 steps["gripper_joint_pos"].append(robot.data.joint_pos.torch[:, hand_ids].clone())
+                if manipuland is not None:
+                    pose = manipuland.data.root_pose_w.torch.clone()
+                    pose[:, :3] -= env.scene.env_origins
+                    steps["manipuland_pose_env"].append(pose)
+                    steps["manipuland_velocity"].append(
+                        manipuland.data.root_vel_w.torch.clone()
+                    )
+                if not env_cfg.task.persistent_goal:
+                    steps["goal_reached"].append(mdp.succeeded(env).clone())
                 env.step(action)
                 held = mdp.held(env)
                 is_open = mdp.succeeded(env)
