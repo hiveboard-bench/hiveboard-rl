@@ -1,4 +1,3 @@
 [submodule "dependencies/isaaclab-hiveboard"]
 	path = dependencies/isaaclab-hiveboard
 	url = https://github.com/hiveboard-bench/isaaclab-hiveboard.git
-	branch = bc-rl
