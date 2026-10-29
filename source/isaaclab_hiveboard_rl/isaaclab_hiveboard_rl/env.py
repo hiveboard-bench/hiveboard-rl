@@ -23,8 +23,8 @@ from isaaclab.utils.configclass import configclass
 
 from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
 
-from isaaclab_hiveboard import tasks as board
-from isaaclab_hiveboard.tasks import (
+from isaaclab_hiveboard import tasks_simple as board
+from isaaclab_hiveboard.tasks_simple import (
     all_ids,
     mechanism_asset,
     mechanism_joint_id,
@@ -43,6 +43,14 @@ ARM_COMMANDS = ("increment", "absolute_integrated", "absolute", "relative_integr
 
 
 def mechanism_rate(env):
+    if env.cfg.task.asset.joint is None:
+        root, body = mechanism_asset(env).data, env.scene["manipuland"].data
+        delta = body.root_pos_w.torch - root.root_pos_w.torch
+        velocity = (
+            body.root_link_lin_vel_w.torch - root.root_link_lin_vel_w.torch
+            - torch.cross(root.root_ang_vel_w.torch, delta, dim=-1)
+        )
+        return math_utils.quat_apply_inverse(root.root_quat_w.torch, velocity)[:, 0]
     return mechanism_asset(env).data.joint_vel.torch[:, mechanism_joint_id(env)]
 
 
@@ -117,24 +125,11 @@ class IntegratedJointPositionActionCfg(JointActionCfg):
     command: str = "increment"
 
 
-def _body_frame_w(env, asset_name, body_name, offset_pos, offset_rot):
-    asset = env.scene[asset_name]
-    body = asset.find_bodies(body_name)[0][0]
-    pos, quat = asset.data.body_pos_w.torch[:, body], asset.data.body_quat_w.torch[:, body]
-    off_pos = torch.tensor(offset_pos, device=env.device, dtype=pos.dtype).expand_as(pos)
-    off_rot = torch.tensor(offset_rot, device=env.device, dtype=quat.dtype).expand_as(quat)
-    return math_utils.combine_frame_transforms(pos, quat, off_pos, off_rot)
-
-
 def grasp_target_w(env):
-    asset = env.cfg.task.asset
-    frame_cfg = next(
-        f for f in env.scene.cfg.target_frame.target_frames if f.name == asset.grasp_frame
-    )
-    body = frame_cfg.prim_path.rsplit("/", 1)[-1]
-    goal_pos, goal_quat = _body_frame_w(
-        env, asset.name, body, frame_cfg.offset.pos, frame_cfg.offset.rot
-    )
+    frame = env.scene["target_frame"].data
+    index = frame.target_frame_names.index(env.cfg.task.asset.grasp_frame)
+    goal_pos = frame.target_pos_w.torch[:, index]
+    goal_quat = frame.target_quat_w.torch[:, index]
     flip = goal_quat.new_tensor([1.0, 0.0, 0.0, 0.0]).expand_as(goal_quat)
     flipped = math_utils.quat_mul(goal_quat, flip)
     _, tcp_quat = tcp_w(env)
@@ -144,8 +139,12 @@ def grasp_target_w(env):
 
 
 def tcp_w(env):
-    ee = env.cfg.robot.ee
-    return _body_frame_w(env, "robot", ee.body_name, ee.tcp_offset.pos, ee.tcp_offset.rot)
+    ee, robot = env.cfg.robot.ee, env.scene["robot"]
+    body = robot.find_bodies(ee.body_name)[0][0]
+    pos, quat = robot.data.body_pos_w.torch[:, body], robot.data.body_quat_w.torch[:, body]
+    off_pos = torch.tensor(ee.tcp_offset.pos, device=env.device, dtype=pos.dtype).expand_as(pos)
+    off_rot = torch.tensor(ee.tcp_offset.rot, device=env.device, dtype=quat.dtype).expand_as(quat)
+    return math_utils.combine_frame_transforms(pos, quat, off_pos, off_rot)
 
 
 def tcp_grasp_error(env):
@@ -283,9 +282,18 @@ def pad_force_excess(env, max_force):
     return (pad_force(env) - max_force).clamp(min=0.0).square().sum(dim=-1)
 
 
-def succeeded(env):
+def _at_goal(env):
     task = env.cfg.task
     return board.opening_sign(env) * (task.target - mechanism_position(env)) <= task.tolerance
+
+
+def succeeded(env):
+    task = env.cfg.task
+    reached = _at_goal(env)
+    if task.persistent_goal:
+        return reached
+    env.goal_reached |= reached
+    return env.goal_reached
 
 
 def released_and_clear(env, min_distance=0.06, max_force=1.0):
@@ -303,14 +311,21 @@ def released_and_clear(env, min_distance=0.06, max_force=1.0):
 
 
 def opening_credited(env, held, ever_held):
-    return ever_held if env.cfg.task.asset.mode == "push" else held
+    contact = ever_held if env.cfg.task.asset.mode == "push" else held
+    return contact if env.cfg.task.persistent_goal else contact & _at_goal(env)
 
 
 def invalid_state(env, asset_cfg, max_joint_vel):
     robot = env.scene["robot"]
     arm_vel = robot.data.joint_vel.torch[:, asset_cfg.joint_ids]
     vel = torch.cat((arm_vel, mechanism_asset(env).data.joint_vel.torch), dim=-1)
+    if env.cfg.task.asset.manipuland_usd is not None:
+        body = env.scene["manipuland"].data
+        vel = torch.cat((vel, body.root_vel_w.torch), dim=-1)
     nonfinite = ~torch.isfinite(robot.data.joint_pos.torch).all(dim=-1)
+    if env.cfg.task.asset.manipuland_usd is not None:
+        body = env.scene["manipuland"].data
+        nonfinite |= ~torch.isfinite(body.root_pose_w.torch).all(dim=-1)
     nonfinite |= ~torch.isfinite(vel).all(dim=-1)
     return nonfinite | (vel.abs() > max_joint_vel).any(dim=-1)
 
@@ -452,6 +467,14 @@ class ExpertBank:
         self.arm_q0 = bank["arm_q0"].float()
         self.position0 = bank["mechanism_position0"].float()
         self.pose_env = bank["mechanism_pose_env"].float()
+        if "manipuland_pose_env0" in bank:
+            for name in (
+                "manipuland_pose_env0", "manipuland_velocity0",
+                "manipuland_pose_env", "manipuland_velocity",
+            ):
+                setattr(self, name, bank[name].float())
+        if "goal_reached" in bank:
+            self.goal_reached = bank["goal_reached"].bool()
         assert list(meta["dynamics"]) == list(board.DYNAMICS), path
         self.dynamics = bank["dynamics"].float()
         column = list(meta["expert_diversity"]).index("turn_rate")
@@ -536,6 +559,13 @@ class reset_from_expert_bank(ManagerTermBase):
         )
         write_mechanism_position(env, ids, self.bank.position0[draw])
         env.dynamics_term.write(ids, self.bank.dynamics[draw])
+        if env.cfg.task.asset.manipuland_usd is not None:
+            pose = self.bank.manipuland_pose_env0[draw].clone()
+            pose[:, :3] += env.scene.env_origins[ids]
+            env.scene["manipuland"].write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
+            env.scene["manipuland"].write_root_velocity_to_sim_index(
+                root_velocity=self.bank.manipuland_velocity0[draw], env_ids=ids
+            )
         robot.write_joint_position_to_sim_index(
             position=self.bank.arm_q0[draw], joint_ids=self._arm_ids, env_ids=ids
         )
@@ -570,6 +600,15 @@ class reset_from_expert_bank(ManagerTermBase):
         )
         rate = (bank.position[draw, nxt] - bank.position[draw, prev]) / span[:, 0]
         write_mechanism_position(env, ids, bank.position[draw, b], rate)
+        if env.cfg.task.asset.manipuland_usd is not None:
+            pose = bank.manipuland_pose_env[draw, b].clone()
+            pose[:, :3] += env.scene.env_origins[ids]
+            env.scene["manipuland"].write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
+            env.scene["manipuland"].write_root_velocity_to_sim_index(
+                root_velocity=bank.manipuland_velocity[draw, b], env_ids=ids
+            )
+        if not env.cfg.task.persistent_goal:
+            env.goal_reached[ids] = bank.goal_reached[draw, b]
 
 
 class reset_from_expert_bank_in_order(reset_from_expert_bank):
@@ -807,13 +846,16 @@ class EventCfg:
     mechanism_gravcomp = None
     robot_physics_material = None
     mechanism_physics_material = None
+    manipuland_physics_material = None
     contacts = None
     reset_all = None
     arm_delay = None
     reset_mechanism_root = None
     reset_mechanism_joint = None
+    reset_manipuland = None
     reset_arm = None
     dynamics = None
+    reset_goal = None
     reset_from_bank = EventTerm(func=reset_from_expert_bank, mode="reset")
     reset_panel = None
     end_stops = None
@@ -891,6 +933,11 @@ def compose(robot_name, task_name, mode):
     asset = cfg.task.asset
     merge(cfg.viewer, {"asset_name": asset.name, **asset.viewer})
     obs, events = cfg.observations, cfg.events
+    if asset.grip_width is not None and cfg.robot.gripper_width_scale is not None:
+        obs.policy.gripper_object.params["moved_above"] += (
+            max(cfg.robot.gripper_close.values())
+            - max(board.ROBOTS[robot_name].gripper_close.values())
+        )
     if asset.mode == "contact_grasp":
         obs.teacher.expert_gripper.params["follow_release"] = True
         cfg.terminations.expert_drift.params["max_error"] = 0.5

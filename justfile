@@ -1,7 +1,7 @@
 set script-interpreter := ["bash"]
 
 robot := env("RL_ROBOT", "anymal")
-task := env("RL_TASK", "open_ball_valve")
+task := env("RL_TASK", "open_ball_valve_simple")
 id := "Isaac-HiveBoard-" + uppercamelcase(robot) + "-" + uppercamelcase(task) + "-RL"
 
 default:
@@ -45,7 +45,7 @@ test:
 [script]
 all threshold="0.8" *args:
     set -eu
-    tasks=$(uv run python -c "from isaaclab_hiveboard.tasks import TASKS; print(*TASKS)")
+    tasks=$(uv run python -c "from isaaclab_hiveboard.tasks_simple import TASKS; print(*TASKS)")
     for robot in $(ls configs/robots | sed 's/.yaml//'); do
         for task in $tasks; do
             just --set robot "$robot" --set task "$task" bank || continue
