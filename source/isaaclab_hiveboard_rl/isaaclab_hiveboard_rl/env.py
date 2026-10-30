@@ -188,7 +188,7 @@ def mechanism_pose_b(env):
 
 
 def grasp_target_b(env):
-    return _in_base(env, *grasp_target_w(env))
+    return torch.nan_to_num(_in_base(env, *grasp_target_w(env)))
 
 
 def tcp_to_grasp_b(env):
