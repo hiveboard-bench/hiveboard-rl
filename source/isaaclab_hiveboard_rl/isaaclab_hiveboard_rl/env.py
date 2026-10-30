@@ -240,6 +240,86 @@ def lever_gripped_obs(env):
     return lever_gripped(env).float().unsqueeze(-1)
 
 
+def lateral_force_limit_cost(env, soft_force, hard_force):
+    lateral = pad_force_split(env)[1]
+    scaled = ((lateral - soft_force) / (hard_force - soft_force)).clamp(min=0.0)
+    return torch.where(scaled <= 1.0, scaled.square(), 2.0 * scaled - 1.0).sum(dim=-1)
+
+
+def arm_target_error(env):
+    arm = env.action_manager.get_term("arm_action")
+    return arm._target - arm.measured()
+
+
+def joint_limit_margin(env, margin, asset_cfg):
+    robot = env.scene[asset_cfg.name]
+    q = robot.data.joint_pos.torch[:, asset_cfg.joint_ids]
+    limits = robot.data.joint_pos_limits.torch[:, asset_cfg.joint_ids]
+    inside = (limits[..., 0] + margin - q).clamp(min=0.0)
+    inside += (q - limits[..., 1] + margin).clamp(min=0.0)
+    return (inside / margin).clamp(max=1.0).square().sum(dim=-1)
+
+
+def torque_saturation(env, soft_ratio, asset_cfg):
+    robot = env.scene[asset_cfg.name]
+    torque = robot.actuators.applied_effort.torch[:, asset_cfg.joint_ids].abs()
+    limit = robot.data.joint_effort_limits.torch[:, asset_cfg.joint_ids]
+    excess = (torque / limit - soft_ratio).clamp(min=0.0) / (1.0 - soft_ratio)
+    return excess.clamp(max=1.0).square().sum(dim=-1)
+
+
+class control_rate_joint_acc(ManagerTermBase):
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        asset_cfg = cfg.params["asset_cfg"]
+        q = env.scene[asset_cfg.name].data.joint_pos.torch[:, asset_cfg.joint_ids]
+        self.prev_q = q.clone()
+        self.prev_v = torch.zeros_like(q)
+        self.has_v = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        asset_cfg = self.cfg.params["asset_cfg"]
+        q = self._env.scene[asset_cfg.name].data.joint_pos.torch[:, asset_cfg.joint_ids]
+        self.prev_q[ids] = q[ids]
+        self.prev_v[ids] = 0.0
+        self.has_v[ids] = False
+
+    def __call__(self, env, asset_cfg, delta):
+        q = env.scene[asset_cfg.name].data.joint_pos.torch[:, asset_cfg.joint_ids]
+        v = (q - self.prev_q) / env.step_dt
+        acc = ((v - self.prev_v) / env.step_dt).abs()
+        cost = torch.where(acc <= delta, acc.square(), 2.0 * delta * acc - delta**2)
+        cost = cost.sum(dim=-1) * self.has_v
+        self.prev_q[:] = q
+        self.prev_v[:] = v
+        self.has_v[:] = True
+        return cost
+
+
+class gripper_chatter(ManagerTermBase):
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.closed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self.since = torch.full((env.num_envs,), math.inf, device=env.device)
+        self.started = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self.started[ids] = False
+        self.since[ids] = math.inf
+
+    def __call__(self, env, min_interval_s):
+        closed = _gripper_closed(env).bool()
+        switched = self.started & (closed != self.closed)
+        self.since += env.step_dt
+        quick = switched & (self.since < min_interval_s)
+        self.since.masked_fill_(switched, 0.0)
+        self.closed[:] = closed
+        self.started[:] = True
+        return quick.float() / env.step_dt
+
+
 def episode_time(env):
     return (reference_step(env).float() / env.max_episode_length).unsqueeze(-1)
 
@@ -950,6 +1030,11 @@ class RewardsCfg:
     arm_joint_vel = RewTerm(func=base_mdp.joint_vel_l2)
     pad_force = RewTerm(func=pad_force_excess)
     overspeed = RewTerm(func=rate_excess)
+    pad_lateral = RewTerm(func=lateral_force_limit_cost)
+    joint_limits = RewTerm(func=joint_limit_margin)
+    torque_saturation = RewTerm(func=torque_saturation)
+    arm_joint_acc = RewTerm(func=control_rate_joint_acc)
+    gripper_chatter = RewTerm(func=gripper_chatter)
     reach_lever = RewTerm(func=reach_while_expert_grips)
     pinch_lever = RewTerm(func=pinch_while_expert_grips)
     task_progress = RewTerm(func=mechanism_task_progress)
@@ -1028,6 +1113,9 @@ def compose(robot_name, task_name, mode):
         obs.teacher.arm_joint_pos,
         obs.teacher.arm_joint_vel,
         cfg.rewards.arm_joint_vel,
+        cfg.rewards.joint_limits,
+        cfg.rewards.torque_saturation,
+        cfg.rewards.arm_joint_acc,
         cfg.terminations.invalid,
     ):
         term.params["asset_cfg"] = arm

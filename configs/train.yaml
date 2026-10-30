@@ -32,6 +32,11 @@ env:
     arm_joint_vel: {weight: -0.001}
     pad_force: {weight: -0.001, params: {max_force: 150.0}}
     overspeed: {weight: -1.0, params: {factor: 1.5}}
+    pad_lateral: {weight: 0.0, params: {soft_force: 35.0, hard_force: 150.0}}
+    joint_limits: {weight: 0.0, params: {margin: 0.1}}
+    torque_saturation: {weight: 0.0, params: {soft_ratio: 0.8}}
+    arm_joint_acc: {weight: 0.0, params: {delta: 10.0}}
+    gripper_chatter: {weight: 0.0, params: {min_interval_s: 0.5}}
     reach_lever: {weight: 0.0, params: {std: 0.05}}
     pinch_lever: {weight: 0.0}
     task_progress: {weight: 0.0, params: {completion_bonus: 0.5}}
