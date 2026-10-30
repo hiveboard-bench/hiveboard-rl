@@ -32,6 +32,9 @@ env:
     arm_joint_vel: {weight: -0.001}
     pad_force: {weight: -0.001, params: {max_force: 150.0}}
     overspeed: {weight: -1.0, params: {factor: 1.5}}
+    reach_lever: {weight: 0.0, params: {std: 0.05}}
+    pinch_lever: {weight: 0.0}
+    task_progress: {weight: 0.0, params: {completion_bonus: 0.5}}
   terminations:
     invalid: {params: {max_joint_vel: 50.0}}
     expert_drift: {params: {max_error: 0.3}}
