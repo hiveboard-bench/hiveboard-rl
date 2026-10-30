@@ -908,7 +908,7 @@ def load(name):
 
 def merge(obj, data):
     for key, value in data.items():
-        current = obj.get(key) if isinstance(obj, dict) else getattr(obj, key)
+        current = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
         if isinstance(value, dict) and "_target_" in value:
             value = instantiate(value, _convert_="all")
         elif isinstance(value, dict) and (isinstance(current, dict) or is_dataclass(current)):
@@ -977,4 +977,5 @@ def runner_cfg(robot, task):
         algorithm=RslRlPpoAlgorithmCfg(),
     )
     merge(cfg, load("train")["agent"])
+    merge(cfg, load(f"robots/{robot}").get("agent", {}))
     return cfg
