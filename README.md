@@ -27,6 +27,9 @@ simulated with Newton MJWarp (no Isaac Sim needed). This repository adds learnin
 
 ## Installation
 
+`just` uses local `.venv` environments, including when Conda is active. uv selects Python 3.12
+for this project and keeps the USD converter in its own environment.
+
 ```bash
 git clone https://github.com/hiveboard-bench/hiveboard-rl.git
 cd hiveboard-rl
@@ -47,6 +50,10 @@ just all                           # every robot and task, gated on expert succe
 
 Select a robot and task with `RL_ROBOT=anymal RL_TASK=open_ball_valve_simple`. Every robot with
 a `configs/robots/<robot>.yaml` is registered with every core task.
+
+If bank collection runs out of GPU memory, use `just bank --plan_batch_size 64` to limit
+cuRobo planning batches independently of `--num_envs`. Changing the planner batch can change
+the collected trajectories for a given seed; keep it fixed when comparing runs.
 
 ## Method
 

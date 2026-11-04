@@ -23,6 +23,7 @@ from isaaclab_rl.rsl_rl import (
 from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli
 
 REVERSAL_RATE = 0.05
+QUICK_SWITCH_S = 0.5
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -54,7 +55,9 @@ if not expert:
     hydra_args += checkpoint.get("bc_overrides", [])
 if args.publication:
     args.num_envs = args.episodes = 1
-args.visualizer = ["newton_rtx"] if args.publication else ["newton_gl"] if args.video else []
+args.visualizer = args.visualizer or []
+if args.video or args.publication:
+    args.visualizer = ["newton_rtx" if args.publication else "newton_gl"]
 sys.argv = [sys.argv[0], *hydra_args]
 
 env_cfg, agent_cfg = resolve_task_config(args.task, "rsl_rl_cfg_entry_point")
@@ -137,11 +140,16 @@ with launch_simulation(env_cfg, args):
     gripper_body = robot.find_bodies(profile.ee.body_name)[0][0]
     arm_ids = robot.find_joints(list(profile.arm_joint_names), preserve_order=True)[0]
     gripper_action = uenv.action_manager.get_term("gripper_action")
+    terms = uenv.action_manager.active_terms
+    gripper_col = sum(uenv.action_manager.action_term_dim[: terms.index("gripper_action")])
     bank_term = uenv.expert_bank_term
     wrist_col = list(profile.arm_joint_names).index(profile.diagnostic_joint)
     stats = {
         key: torch.zeros(n_envs, dtype=torch.bool, device=dev)
-        for key in ("reached", "grasped", "success", "opened_any", "clear")
+        for key in (
+            "reached", "grasped", "success", "opened_any", "clear", "pinched", "opened_pinched",
+            "grip_closed",
+        )
     }
     stats |= {
         key: torch.zeros(n_envs, device=dev)
@@ -162,6 +170,9 @@ with launch_simulation(env_cfg, args):
             "release_peak_speed",
             "release_acc_sq",
             "release_velocity_err_sq",
+            "pinch_steps",
+            "grip_switches",
+            "grip_quick_switches",
         )
     }
     stats |= {
@@ -171,6 +182,7 @@ with launch_simulation(env_cfg, args):
     stats |= {
         "t_success": torch.full((n_envs,), float("nan"), device=dev),
         "grasp_wrist": torch.full((n_envs,), float("nan"), device=dev),
+        "grip_since": torch.full((n_envs,), float("nan"), device=dev),
         "commanded_rate": turn.rate.clone(),
         "prev_q": robot.data.joint_pos.torch[:, arm_ids].clone(),
         "bank_index": bank_term.index.clone(),
@@ -205,6 +217,10 @@ with launch_simulation(env_cfg, args):
             ]
             stats["grasped"] |= held
             stats["opened_any"] |= opened
+            pinched = mdp.lever_gripped(uenv)
+            stats["pinched"] |= pinched
+            stats["opened_pinched"] |= pinched & opened
+            stats["pinch_steps"] += pinched.float()
             stats["clear"] = mdp.released_and_clear(uenv)
             stats["end_progress"] = progress.clone()
             stats["end_tcp_dist"] = dist.clone()
@@ -255,9 +271,9 @@ with launch_simulation(env_cfg, args):
             stats["max_mechanism_rate"] = torch.maximum(
                 stats["max_mechanism_rate"], mdp.mechanism_state(uenv)[:, 1].abs()
             )
-            squeeze, lateral = mdp.pad_force_split(uenv)
+            lateral = mdp.pad_force_split(uenv)[1]
             stats["max_pad_squeeze"] = torch.maximum(
-                stats["max_pad_squeeze"], squeeze.max(dim=-1).values
+                stats["max_pad_squeeze"], mdp.pad_pinch_force(uenv).min(dim=-1).values
             )
             stats["max_pad_lateral"] = torch.maximum(
                 stats["max_pad_lateral"], lateral.max(dim=-1).values
@@ -267,6 +283,14 @@ with launch_simulation(env_cfg, args):
             )
 
             action = mdp.expert_action(uenv) if expert else policy(obs)
+            closed = action[:, gripper_col] < 0.0
+            switched = (step_count >= 1) & (closed != stats["grip_closed"])
+            stats["grip_since"] += dt
+            stats["grip_switches"] += switched.float()
+            quick = switched & (stats["grip_since"] < QUICK_SWITCH_S)
+            stats["grip_quick_switches"] += quick.float()
+            stats["grip_since"][switched] = 0.0
+            stats["grip_closed"] = closed
             if args.save:
                 buffers["policy"][rows, step_count] = obs["policy"]
                 buffers["teacher"][rows, step_count] = obs["teacher"]
@@ -279,6 +303,9 @@ with launch_simulation(env_cfg, args):
             step_count += 1
             total_steps += 1
             invalid = uenv.termination_manager.get_term("invalid")
+            collided = torch.zeros_like(invalid)
+            if "arm_collision" in uenv.termination_manager.active_terms:
+                collided = uenv.termination_manager.get_term("arm_collision")
             for i in dones.nonzero(as_tuple=False).flatten().tolist():
                 if len(episodes) >= args.episodes:
                     break
@@ -299,6 +326,9 @@ with launch_simulation(env_cfg, args):
                     {
                         "success": bool(stats["success"][i]),
                         "opened_any": bool(stats["opened_any"][i]),
+                        "pinched": bool(stats["pinched"][i]),
+                        "opened_pinched": bool(stats["opened_pinched"][i]),
+                        "pinch_s": float(stats["pinch_steps"][i] * dt),
                         "released_clear_at_end": bool(stats["clear"][i]),
                         "end_progress": float(stats["end_progress"][i]),
                         "end_tcp_dist_m": float(stats["end_tcp_dist"][i]),
@@ -319,6 +349,9 @@ with launch_simulation(env_cfg, args):
                         if stats["turn_steps"][i] > 0
                         else float("nan"),
                         "invalid": bool(invalid[i]),
+                        "collided": bool(collided[i]),
+                        "gripper_switches": int(stats["grip_switches"][i]),
+                        "quick_gripper_switches": int(stats["grip_quick_switches"][i]),
                         "joint_steps": float(stats["joint_steps"][i]),
                         "joint_err_sq": stats["joint_err_sq"][i].tolist(),
                         "joint_acc_sq": stats["joint_acc_sq"][i].tolist(),
@@ -353,7 +386,8 @@ with launch_simulation(env_cfg, args):
                         }
                     )
                 for key, value in stats.items():
-                    value[i] = float("nan") if key in ("t_success", "grasp_wrist") else 0
+                    nan_keys = ("t_success", "grasp_wrist", "grip_since")
+                    value[i] = float("nan") if key in nan_keys else 0
                 stats["bank_index"][i] = bank_term.index[i]
                 stats["prev_q"][i] = robot.data.joint_pos.torch[i, arm_ids]
                 step_count[i] = 0
@@ -459,7 +493,10 @@ summary = {
         "opened_any": sum(e["opened_any"] for e in episodes) / n,
         "released_clear_at_end": sum(e["released_clear_at_end"] for e in episodes) / n,
         "complete": sum(e["success"] and e["released_clear_at_end"] for e in episodes) / n,
+        "pinched": sum(e["pinched"] for e in episodes) / n,
+        "opened_pinched": sum(e["opened_pinched"] for e in episodes) / n,
     },
+    "mean_pinch_s": sum(e["pinch_s"] for e in episodes) / n,
     "mean_max_progress": sum(e["max_progress"] for e in episodes) / n,
     "max_pad_force_n": max(e["max_pad_force_n"] for e in episodes),
     "pad_squeeze_n_p50_p99": torch.quantile(
@@ -473,6 +510,10 @@ summary = {
     "mean_commanded_rate_rad_s": sum(e["commanded_rate_rad_s"] for e in episodes) / n,
     "mean_achieved_rate_rad_s": nanmean([e["achieved_rate_rad_s"] for e in episodes]),
     "invalid_episodes": sum(e["invalid"] for e in episodes),
+    "collision_episodes": sum(e["collided"] for e in episodes),
+    "mean_gripper_switches": sum(e["gripper_switches"] for e in episodes) / n,
+    "mean_quick_gripper_switches": sum(e["quick_gripper_switches"] for e in episodes) / n,
+    "quick_gripper_switch_episodes": sum(e["quick_gripper_switches"] > 0 for e in episodes),
     "per_joint": per_joint,
     "release_motion": {
         "episodes_with_samples": sum(e["release_steps"] > 0 for e in episodes),
@@ -519,11 +560,15 @@ print(
 )
 print(f"complete     {stages['complete']:.1%} (opened while held, then released and clear)")
 print(
+    f"pinch        pinched {stages['pinched']:.1%} | opened while pinching"
+    f" {stages['opened_pinched']:.1%} | mean {summary['mean_pinch_s']:.2f} s pinched"
+)
+print(
     f"progress     mean max {summary['mean_max_progress']:.3f}"
     f" | peak pad force {summary['max_pad_force_n']:.1f} N"
 )
 print(
-    f"pad force    per-episode peak, median / p99: squeeze {sq[0]:.0f} / {sq[1]:.0f} N"
+    f"pad force    per-episode peak, median / p99: pinch {sq[0]:.0f} / {sq[1]:.0f} N"
     f" | lateral {lat[0]:.0f} / {lat[1]:.0f} N"
 )
 print(
@@ -535,6 +580,12 @@ print(
     f" | mean peak gripper speed {summary['mean_peak_tcp_speed_m_s']:.2f} m/s"
 )
 print(f"invalid      {summary['invalid_episodes']} episodes")
+print(f"collided     {summary['collision_episodes']} episodes")
+print(
+    f"gripper      {summary['mean_gripper_switches']:.2f} switches per episode,"
+    f" {summary['mean_quick_gripper_switches']:.2f} within {QUICK_SWITCH_S} s"
+    f" ({summary['quick_gripper_switch_episodes']} episodes)"
+)
 print("per joint    (policy | expert bank), from reset until open-while-held")
 print(f"  {'joint':<28}{'RMS err vs expert':>18}{'RMS accel':>22}{'reversals/s':>20}")
 for name, row in per_joint.items():

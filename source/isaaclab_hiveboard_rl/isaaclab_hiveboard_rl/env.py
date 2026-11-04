@@ -36,6 +36,7 @@ from isaaclab_tasks.core.cabinet import mdp as base_mdp
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 CONTACT_FORCE_N = 1.0
+PINCH_FORCE_N = 5.0
 IDLE_STEP_RAD = 1.0e-3
 HOLD_DIST = 0.03
 HOLD_ANG = 0.35
@@ -188,7 +189,7 @@ def mechanism_pose_b(env):
 
 
 def grasp_target_b(env):
-    return _in_base(env, *grasp_target_w(env))
+    return torch.nan_to_num(_in_base(env, *grasp_target_w(env)))
 
 
 def tcp_to_grasp_b(env):
@@ -219,6 +220,106 @@ def pad_force_split(env, sensor_names=("finger_contact", "jaw_contact")):
         squeeze.append(sign * along[:, 0])
         lateral.append((force - along * axis).norm(dim=-1))
     return torch.stack(squeeze, dim=-1), torch.stack(lateral, dim=-1)
+
+
+def pad_pinch_force(env):
+    return -pad_force_split(env)[0]
+
+
+def lever_gripped(env):
+    gripped = (pad_pinch_force(env) >= PINCH_FORCE_N).all(dim=-1) & _gripper_closed(env).bool()
+    if env.cfg.pinch_finger_pos is not None:
+        robot = env.scene["robot"]
+        fingers = robot.find_joints(list(env.cfg.robot.finger_joint_names), preserve_order=True)[0]
+        finger = robot.data.joint_pos.torch[:, fingers].min(dim=-1).values
+        gripped &= finger > env.cfg.pinch_finger_pos
+    return gripped
+
+
+def lever_gripped_obs(env):
+    return lever_gripped(env).float().unsqueeze(-1)
+
+
+def lateral_force_limit_cost(env, soft_force, hard_force):
+    lateral = pad_force_split(env)[1]
+    scaled = ((lateral - soft_force) / (hard_force - soft_force)).clamp(min=0.0)
+    return torch.where(scaled <= 1.0, scaled.square(), 2.0 * scaled - 1.0).sum(dim=-1)
+
+
+def arm_target_error(env):
+    arm = env.action_manager.get_term("arm_action")
+    if isinstance(arm, IntegratedJointPositionAction):
+        return arm._target - arm.measured()
+    return arm.processed_actions - arm._asset.data.joint_pos.torch[:, arm._joint_ids]
+
+
+def joint_limit_margin(env, margin, asset_cfg):
+    robot = env.scene[asset_cfg.name]
+    q = robot.data.joint_pos.torch[:, asset_cfg.joint_ids]
+    limits = robot.data.joint_pos_limits.torch[:, asset_cfg.joint_ids]
+    inside = (limits[..., 0] + margin - q).clamp(min=0.0)
+    inside += (q - limits[..., 1] + margin).clamp(min=0.0)
+    return (inside / margin).clamp(max=1.0).square().sum(dim=-1)
+
+
+def torque_saturation(env, soft_ratio, asset_cfg):
+    robot = env.scene[asset_cfg.name]
+    torque = robot.actuators.applied_effort.torch[:, asset_cfg.joint_ids].abs()
+    limit = robot.data.joint_effort_limits.torch[:, asset_cfg.joint_ids]
+    excess = (torque / limit - soft_ratio).clamp(min=0.0) / (1.0 - soft_ratio)
+    return excess.clamp(max=1.0).square().sum(dim=-1)
+
+
+class control_rate_joint_acc(ManagerTermBase):
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        asset_cfg = cfg.params["asset_cfg"]
+        q = env.scene[asset_cfg.name].data.joint_pos.torch[:, asset_cfg.joint_ids]
+        self.prev_q = q.clone()
+        self.prev_v = torch.zeros_like(q)
+        self.has_v = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        asset_cfg = self.cfg.params["asset_cfg"]
+        q = self._env.scene[asset_cfg.name].data.joint_pos.torch[:, asset_cfg.joint_ids]
+        self.prev_q[ids] = q[ids]
+        self.prev_v[ids] = 0.0
+        self.has_v[ids] = False
+
+    def __call__(self, env, asset_cfg, delta):
+        q = env.scene[asset_cfg.name].data.joint_pos.torch[:, asset_cfg.joint_ids]
+        v = (q - self.prev_q) / env.step_dt
+        acc = ((v - self.prev_v) / env.step_dt).abs()
+        cost = torch.where(acc <= delta, acc.square(), 2.0 * delta * acc - delta**2)
+        cost = cost.sum(dim=-1) * self.has_v
+        self.prev_q[:] = q
+        self.prev_v[:] = v
+        self.has_v[:] = True
+        return cost
+
+
+class gripper_chatter(ManagerTermBase):
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.closed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self.since = torch.full((env.num_envs,), math.inf, device=env.device)
+        self.started = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self.started[ids] = False
+        self.since[ids] = math.inf
+
+    def __call__(self, env, min_interval_s):
+        closed = _gripper_closed(env).bool()
+        switched = self.started & (closed != self.closed)
+        self.since += env.step_dt
+        quick = switched & (self.since < min_interval_s)
+        self.since.masked_fill_(switched, 0.0)
+        self.closed[:] = closed
+        self.started[:] = True
+        return quick.float() / env.step_dt
 
 
 def episode_time(env):
@@ -294,6 +395,36 @@ def succeeded(env):
         return reached
     env.goal_reached |= reached
     return env.goal_reached
+
+
+class mechanism_task_progress(ManagerTermBase):
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.credited = torch.zeros(env.num_envs, device=env.device)
+        self.completed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env.progress_term = self
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self.credited[ids] = mechanism_progress(self._env)[ids]
+        self.completed[ids] = _at_goal(self._env)[ids]
+
+    def __call__(self, env, completion_bonus):
+        gripped = lever_gripped(env)
+        progress = torch.maximum(self.credited, mechanism_progress(env))
+        credited = torch.where(gripped, progress, self.credited)
+        done = gripped & _at_goal(env) & ~self.completed
+        gain = credited - self.credited
+        self.credited = credited
+        self.completed |= done
+        return (gain + completion_bonus * done.float()) / env.step_dt
+
+
+def credited_progress(env):
+    term = getattr(env, "progress_term", None)
+    if term is None:
+        return torch.zeros(env.num_envs, 2, device=env.device)
+    return torch.stack((term.credited, term.completed.float()), dim=-1)
 
 
 def released_and_clear(env, min_distance=0.06, max_force=1.0):
@@ -666,8 +797,14 @@ def expert_mechanism_error(env):
     return (mechanism_position(env) - reference).unsqueeze(-1)
 
 
-def track_expert_mechanism(env, std):
-    return torch.exp(-expert_mechanism_error(env)[:, 0].square() / std**2)
+def track_expert_mechanism(env, std, gate_on_grip=False):
+    reward = torch.exp(-expert_mechanism_error(env)[:, 0].square() / std**2)
+    if not gate_on_grip:
+        return reward
+    term = env.expert_bank_term
+    step = term.bank._bank_step(term.index, reference_step(env))
+    expert_grips = term.bank.contact[term.index, step].min(dim=-1).values > 0
+    return torch.where(expert_grips & ~lever_gripped(env), torch.zeros_like(reward), reward)
 
 
 def expert_gripper_reference(env, follow_release, follow_reach):
@@ -695,6 +832,20 @@ def track_expert_contact(env):
     step = term.bank._bank_step(term.index, reference_step(env))
     expert = term.bank.contact[term.index, step]
     return (policy == expert).float().mean(dim=-1)
+
+
+def _expert_closed(env):
+    term = env.expert_bank_term
+    return term.bank.gripper_closed_reference(term.index, reference_step(env))
+
+
+def reach_while_expert_grips(env, std):
+    reach = 1.0 - torch.tanh(tcp_grasp_error(env)[0] / std)
+    return reach * _expert_closed(env).float()
+
+
+def pinch_while_expert_grips(env):
+    return (lever_gripped(env) & _expert_closed(env)).float()
 
 
 def expert_joint_drift(env, max_error):
@@ -881,6 +1032,14 @@ class RewardsCfg:
     arm_joint_vel = RewTerm(func=base_mdp.joint_vel_l2)
     pad_force = RewTerm(func=pad_force_excess)
     overspeed = RewTerm(func=rate_excess)
+    pad_lateral = RewTerm(func=lateral_force_limit_cost)
+    joint_limits = RewTerm(func=joint_limit_margin)
+    torque_saturation = RewTerm(func=torque_saturation)
+    arm_joint_acc = RewTerm(func=control_rate_joint_acc)
+    gripper_chatter = RewTerm(func=gripper_chatter)
+    reach_lever = RewTerm(func=reach_while_expert_grips)
+    pinch_lever = RewTerm(func=pinch_while_expert_grips)
+    task_progress = RewTerm(func=mechanism_task_progress)
 
 
 @configclass
@@ -899,6 +1058,7 @@ class EnvCfg(board.HiveBoardEnvCfg):
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     commands: CommandsCfg = CommandsCfg()
+    pinch_finger_pos: float | None = None
 
 
 def load(name):
@@ -908,7 +1068,7 @@ def load(name):
 
 def merge(obj, data):
     for key, value in data.items():
-        current = obj.get(key) if isinstance(obj, dict) else getattr(obj, key)
+        current = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
         if isinstance(value, dict) and "_target_" in value:
             value = instantiate(value, _convert_="all")
         elif isinstance(value, dict) and (isinstance(current, dict) or is_dataclass(current)):
@@ -955,6 +1115,9 @@ def compose(robot_name, task_name, mode):
         obs.teacher.arm_joint_pos,
         obs.teacher.arm_joint_vel,
         cfg.rewards.arm_joint_vel,
+        cfg.rewards.joint_limits,
+        cfg.rewards.torque_saturation,
+        cfg.rewards.arm_joint_acc,
         cfg.terminations.invalid,
     ):
         term.params["asset_cfg"] = arm
@@ -977,4 +1140,5 @@ def runner_cfg(robot, task):
         algorithm=RslRlPpoAlgorithmCfg(),
     )
     merge(cfg, load("train")["agent"])
+    merge(cfg, load(f"robots/{robot}").get("agent", {}))
     return cfg

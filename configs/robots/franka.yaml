@@ -1,13 +1,57 @@
 delay_s: 0.0
 delayed_groups: []
 env:
+  pinch_finger_pos: 0.0106
+  scene:
+    arm_contact:
+      _target_: isaaclab.sensors.ContactSensorCfg
+      prim_path: "{ENV_REGEX_NS}/Robot/fr3_(link[1-7]|hand)"
+      update_period: 0.0
+      history_length: 1
   observations:
     policy:
       gripper_pos:
         noise: {_target_: isaaclab.utils.noise.UniformNoiseCfg, n_min: -0.0002, n_max: 0.0002}
       gripper_object: {params: {stopped_below: 0.035, moved_above: 0.0105, max_speed: 0.001}}
+      arm_target_error:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: isaaclab_hiveboard_rl.env:arm_target_error
+        noise: {_target_: isaaclab.utils.noise.UniformNoiseCfg, n_min: -0.002, n_max: 0.002}
+    teacher:
+      episode_time:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: isaaclab_hiveboard_rl.env:episode_time
+      task_progress:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: isaaclab_hiveboard_rl.env:credited_progress
+      lever_gripped:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: isaaclab_hiveboard_rl.env:lever_gripped_obs
+      arm_target_error:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: isaaclab_hiveboard_rl.env:arm_target_error
   rewards:
-    track_expert_gripper: {params: {std: 0.002}}
+    track_expert_gripper: {params: {std: 0.02}}
+    track_expert_velocity: {weight: 2.0, params: {std: 0.15}}
+    track_expert_mechanism: {params: {gate_on_grip: true}}
+    track_expert_mechanism_coarse: {params: {gate_on_grip: true}}
+    action_rate: {weight: -1.0}
+    pad_force: null
+    pad_lateral: {weight: -5.0}
+    joint_limits: {weight: -1.0}
+    torque_saturation: {weight: -2.0}
+    arm_joint_acc: {weight: -0.03}
+    gripper_chatter: {weight: -1.0}
+    reach_lever: {weight: 3.0}
+    pinch_lever: {weight: 5.0}
+    task_progress: {weight: 10.0}
+  terminations:
+    arm_collision:
+      _target_: isaaclab.managers.TerminationTermCfg
+      func: isaaclab.envs.mdp:illegal_contact
+      params:
+        threshold: 10.0
+        sensor_cfg: {_target_: isaaclab.managers.SceneEntityCfg, name: arm_contact}
   events:
     target_delay:
       _target_: isaaclab.managers.EventTermCfg
@@ -15,3 +59,5 @@ env:
       mode: reset
       params: {delay_range_s: [0.0, 0.04]}
   viewer: {origin_type: env, env_index: 0, eye: [0.85, -0.75, 0.85], lookat: [0.6, 0.0, 0.1]}
+agent:
+  algorithm: {use_clipped_value_loss: false}
