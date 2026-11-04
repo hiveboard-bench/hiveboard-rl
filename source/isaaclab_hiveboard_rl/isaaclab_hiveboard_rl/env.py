@@ -248,7 +248,9 @@ def lateral_force_limit_cost(env, soft_force, hard_force):
 
 def arm_target_error(env):
     arm = env.action_manager.get_term("arm_action")
-    return arm._target - arm.measured()
+    if isinstance(arm, IntegratedJointPositionAction):
+        return arm._target - arm.measured()
+    return arm.processed_actions - arm._asset.data.joint_pos.torch[:, arm._joint_ids]
 
 
 def joint_limit_margin(env, margin, asset_cfg):
