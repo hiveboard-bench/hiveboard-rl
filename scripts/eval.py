@@ -55,7 +55,9 @@ if not expert:
     hydra_args += checkpoint.get("bc_overrides", [])
 if args.publication:
     args.num_envs = args.episodes = 1
-args.visualizer = ["newton_rtx"] if args.publication else ["newton_gl"] if args.video else []
+args.visualizer = args.visualizer or []
+if args.video or args.publication:
+    args.visualizer = ["newton_rtx" if args.publication else "newton_gl"]
 sys.argv = [sys.argv[0], *hydra_args]
 
 env_cfg, agent_cfg = resolve_task_config(args.task, "rsl_rl_cfg_entry_point")
