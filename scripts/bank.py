@@ -13,7 +13,11 @@ from isaaclab.envs.utils.video_recorder_cfg import VideoRecorderCfg
 from isaaclab.managers import EventTermCfg
 from isaaclab.managers.recorder_manager import RecorderManagerBaseCfg
 
-from isaaclab_hiveboard.mdp.commands.sequential_pose_command import PHASES
+from isaaclab_hiveboard.mdp.commands.sequential_pose_command import (
+    PHASES,
+    CuroboPlannedGoToFrameCfg,
+    CuroboPlannedRotateFrameCfg,
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--robot", default="anymal")
@@ -22,6 +26,9 @@ parser.add_argument(
     help="simplified single-goal task from core tasks_simple.TASKS",
 )
 parser.add_argument("--num_envs", type=int, default=512)
+parser.add_argument(
+    "--plan_batch_size", type=int, help="cuRobo batch size (defaults to --num_envs)"
+)
 parser.add_argument("--num_trajectories", type=int, default=5000)
 parser.add_argument("--max_waves", type=int, default=50)
 parser.add_argument("--seed", type=int, default=0)
@@ -52,6 +59,11 @@ env_cfg.rewards = {}
 env_cfg.terminations = {"time_out": env_cfg.terminations.time_out}
 env_cfg.recorders = RecorderManagerBaseCfg()
 max_open_s = mdp.board.expert(env_cfg)
+if args.plan_batch_size is not None:
+    assert args.plan_batch_size > 0
+    for command in env_cfg.commands.pose_command.commands:
+        if isinstance(command, (CuroboPlannedGoToFrameCfg, CuroboPlannedRotateFrameCfg)):
+            command.plan_batch_size = min(args.num_envs, args.plan_batch_size)
 env_cfg.commands.reference = None
 actuators = dict(env_cfg.scene.robot.actuators)
 for name in profile.actuator_groups:
@@ -301,6 +313,8 @@ with launch_simulation(env_cfg, args):
         "diagnostic_joint": profile.diagnostic_joint,
         "physics_dt": env.physics_dt,
         "seed": args.seed,
+        "num_envs": n_envs,
+        "plan_batch_size": min(args.num_envs, args.plan_batch_size or args.num_envs),
         "task_cfg": env_cfg.task.to_dict(),
         "method": env_cfg.task.asset.method,
         "dt": env.step_dt,

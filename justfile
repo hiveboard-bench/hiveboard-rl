@@ -1,5 +1,8 @@
 set script-interpreter := ["bash"]
 
+export UV_PROJECT_ENVIRONMENT := ".venv"
+export UV_NO_SYNC := "0"
+
 robot := env("RL_ROBOT", "anymal")
 task := env("RL_TASK", "open_ball_valve_simple")
 id := "Isaac-HiveBoard-" + uppercamelcase(robot) + "-" + uppercamelcase(task) + "-RL"
@@ -18,10 +21,10 @@ setup:
 core := "dependencies/isaaclab-hiveboard"
 
 assets *args:
-    uv run python {{core}}/scripts/generate_anymal_newton_usd.py {{args}}
-    uv run python {{core}}/scripts/generate_newton_usd.py --assets all {{args}}
     cp {{core}}/dependencies/HiveBoard/Simulation/Honeycomb/*.usd \
         {{core}}/source/isaaclab_hiveboard/isaaclab_hiveboard/assets/hiveboard/honeycomb/
+    uv run python {{core}}/scripts/generate_anymal_newton_usd.py {{args}}
+    uv run python {{core}}/scripts/generate_newton_usd.py --assets all {{args}}
 
 bank *args:
     uv run python scripts/bank.py --robot {{robot}} --task {{task}} {{args}}
