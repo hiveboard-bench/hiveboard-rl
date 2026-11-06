@@ -107,9 +107,10 @@ reward details and evaluation results.
 then withdraws. It trains a separate policy with the same PPO architecture as the valve.
 Push progress requires pad contact during the episode, including contact before a bank mid-start.
 Progress and completion pay once, and can continue after contact ends. Mechanism reference positions
-come from the bank; the expert speed command is in m/s. Pinch, fixed-target reach and lateral-force
-rewards are disabled. Total pad force above 150 N is penalized instead. Mechanism-lag termination is
-disabled because the toggle can switch faster than the policy matches the expert's timing.
+come from the bank; the expert speed command is in m/s. Pinch and fixed-target reach rewards are
+disabled. Force costs penalize total pad force above 150 N and force perpendicular to the push axis
+above 35 N. The push axis follows mechanism-local Z (world X at the nominal Franka pose).
+Mechanism-lag termination is disabled to allow timing differences in the toggle transition.
 
 ```bash
 export RL_ROBOT=franka RL_TASK=switch_circuit_breaker_simple

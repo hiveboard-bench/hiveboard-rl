@@ -27,8 +27,8 @@ A separate PPO policy is trained from scratch with `[512, 256, 128]` actor and c
 The actor sees proprioception, an initial mechanism estimate and history; the critic also sees
 true state, contacts, dynamics and expert errors.
 
-The expert approaches below the toggle, pushes upward with closed fingers and retreats. The
-training bank has 1,000 trajectories (96.8% raw expert success); the held-out bank has 200
+The expert approaches below the toggle, pushes along its switching axis with closed fingers and
+retreats. The training bank has 1,000 trajectories (96.8% raw expert success); the held-out bank has 200
 (98.6%, seed 10020). Collection used 512 environments and planning batches of 64, filtering out
 fallbacks, incomplete withdrawals and switches taking over five seconds.
 
@@ -55,49 +55,51 @@ Push-specific rewards replace the valve's pinch and reach incentives. Overrides 
 | Hardware | `arm_joint_acc` | -0.03 | high arm joint acceleration |
 | Hardware | `action_magnitude` | -0.02 | large actions |
 | Hardware | `arm_joint_vel` | -0.001 | fast arm joints |
-| Hardware | `pad_force` | -0.001 | squared pad force above 150 N |
+| Hardware | `pad_force` | -0.002 | squared pad force above 150 N |
+| Hardware | `pad_lateral` | -2 | force perpendicular to the push axis, above 35 N |
 
 Progress pays only for new gains after either pad exceeds 1 N, including motion after contact ends.
 Completion adds a one-time 0.5 bonus before weighting. The critic sees progress and contact history.
 Mechanism tracking uses bank angles with 0.1/0.5 rad tolerances and requires current policy contact
 whenever the expert touches. Push speed is measured in m/s.
 
-`pinch_lever`, `reach_lever`, `pad_lateral` and `overspeed` are off. Total force replaces lateral
-force because pushing requires sideways force. Mechanism-lag termination is disabled to allow timing
-differences in the toggle transition. Arm drift, invalid-state and collision terminations remain.
+The push follows mechanism-local +Z (world -X at the nominal Franka pose). `pad_lateral` uses
+`axis: 2` to penalize each pad's force perpendicular to that axis, following mechanism orientation.
+Its normalized cost is quadratic from 35 to 150 N, then linear. `pad_force` penalizes squared
+excess above 150 N per pad in every direction. Both costs sum over the two pads.
+Evaluation reports off-axis forces separately from gripper-relative lateral forces.
+
+`pinch_lever`, `reach_lever` and `overspeed` are off. Mechanism-lag termination is disabled;
+arm drift, invalid-state and collision terminations remain.
 
 ## Evaluation and results
 
-Run `2026-11-05_16-27-55`: seed 0, 4,096 environments, 1,000 PPO iterations. Evaluation used
-300 episodes, 100 environments and seed 100, visiting 143 distinct held-out bank entries.
+Run `2026-11-06_13-55-44_force_penalties`: seed 0, 4,096 environments, 1,000 PPO iterations.
+Evaluation of `model_999.pt` used 300 episodes, 100 environments and seed 100,
+visiting 143 distinct held-out bank entries.
 Solver settings matched training (50/10/30). Evaluation starts at the beginning of trajectories,
 with bank dynamics, registration noise and target delay. Expert drift terminations are disabled.
 
 **Success** requires reaching the goal after pad contact. **Complete** requires the goal retained
 at the end, pad forces below 1 N and TCP clearance of at least 6 cm from `lever_pivot_below`.
 
-| Checkpoint | Complete | Mean time to switch | Maximum pad force |
-|---|---|---|---|
-| 100 | 272/300 (90.7%) | 3.35 s | 707 N |
-| 200 | 300/300 (100%) | 3.27 s | 867 N |
-| 300 | 300/300 (100%) | 3.26 s | 707 N |
-| 400 | 300/300 (100%) | 3.22 s | 809 N |
-| 500 | 299/300 (99.7%) | 3.25 s | 815 N |
-| 600 | 300/300 (100%) | 3.26 s | 568 N |
-| 700 | 300/300 (100%) | 3.23 s | 367 N |
-| 800 | 300/300 (100%) | 3.31 s | 534 N |
-| 900 | 300/300 (100%) | 3.30 s | 432 N |
-| 999 | **300/300 (100%)** | **3.25 s** | **520 N** |
+| Metric | Result |
+|---|---|
+| Success and complete | **300/300 (100%)** |
+| Time to switch, mean +/- std | **3.25 +/- 0.05 s** |
+| Maximum pad force | 403 N |
+| Peak pad force, median / p99 | 148 / 343 N |
+| Peak off-axis force, median / p99 | 68 / 241 N |
+| Peak gripper-relative lateral force, median / p99 | 147 / 343 N |
 
-All checkpoints had zero collisions and invalid episodes. Checkpoint 999 had no gripper command
-switches and lateral force p99 of 398 N. The selector preferred checkpoint 700 for its lower peak
-force at equal completion. Results cover one training seed; this held-out bank serves as validation.
-Reports: `tests/breaker_evaluation/2026-11-05_16-27-55/`.
+Force quantiles use each episode's peak. There were zero collisions, invalid episodes or gripper
+command switches. Results cover one training seed; this held-out bank serves as validation.
+Report: `tests/breaker_force_evaluation/2026-11-06_13-55-44_force_penalties/model_999.json`.
 
 ## What needs to be improved
 
 - **Contact forces:** 150 N is a soft penalty threshold; force peaks remain high.
-- **Withdrawal:** checkpoint 100 switched 300/300 times but completed 272. Select by complete rate.
+- **Motion:** joint acceleration remains above the expert's on several joints.
 - **Validation:** repeat seeds and collect new evaluation starts after checkpoint selection.
 
 ## Reproduce
@@ -106,7 +108,6 @@ Run these commands from the repository root after `just setup` and `just assets`
 
 ```bash
 export RL_ROBOT=franka RL_TASK=switch_circuit_breaker_simple
-bank=logs/expert_bank/franka_switch_circuit_breaker_simple.pt
 heldout=logs/expert_bank/franka_switch_circuit_breaker_simple_heldout.pt
 
 just bank --num_trajectories 1000 --plan_batch_size 64 --seed 0
@@ -114,7 +115,7 @@ just bank --num_trajectories 1000 --plan_batch_size 64 --seed 0
 just bank --num_trajectories 200 --plan_batch_size 64 --seed 10020 \
     --output "$heldout"
 
-just train --num_envs 4096 --seed 0 --max_iterations 1000 \
+just train --num_envs 4096 --seed 0 --max_iterations 1000 --run_name force_penalties \
     env.sim.physics.use_cuda_graph=true env.sim.physics.solver_cfg.iterations=50 \
     env.sim.physics.solver_cfg.ls_iterations=10 env.sim.physics.solver_cfg.ccd_iterations=30
 ```
@@ -122,7 +123,7 @@ just train --num_envs 4096 --seed 0 --max_iterations 1000 \
 Keep collection batch sizes fixed for comparisons. Replace the timestamp below for a new run.
 
 ```bash
-run=logs/rsl_rl/franka_switch_circuit_breaker_simple/2026-11-05_16-27-55
+run=logs/rsl_rl/franka_switch_circuit_breaker_simple/2026-11-06_13-55-44_force_penalties
 checkpoint="$run/model_999.pt"
 
 just eval "$checkpoint" --episodes 300 --num_envs 100 --seed 100 \
@@ -131,8 +132,6 @@ just eval "$checkpoint" --episodes 300 --num_envs 100 --seed 100 \
     env.sim.physics.solver_cfg.ls_iterations=10 env.sim.physics.solver_cfg.ccd_iterations=30
 ```
 
-Use `model_700.pt` for the sweep's selected checkpoint; training return uses a different ranking.
-
 ## Visualize and record
 
 Default camera: eye `[0.90, -0.55, 0.50]`, lookat `[0.60, 0.00, 0.10]`, relative to environment 0.
@@ -140,13 +139,16 @@ Default camera: eye `[0.90, -0.55, 0.50]`, lookat `[0.60, 0.00, 0.10]`, relative
 ```bash
 just eval "$checkpoint" --episodes 100 --num_envs 1 --visualizer newton_gl --seed 100 \
     env.events.reset_from_bank.params.path="$heldout" \
-    env.sim.physics.use_cuda_graph=true
+    env.sim.physics.use_cuda_graph=true env.sim.physics.solver_cfg.iterations=50 \
+    env.sim.physics.solver_cfg.ls_iterations=10 env.sim.physics.solver_cfg.ccd_iterations=30
 ```
 
 Publication recording uses 1080p RTX rendering and CRF 12 encoding: one standard-start episode
 with nominal physics and no observation noise or delays, separate from held-out evaluation.
 
 ```bash
-video=videos/franka_switch_circuit_breaker_simple_publication
-just video "$checkpoint" "$video" --seed 100 env.sim.physics.use_cuda_graph=true
+video=videos/franka_switch_circuit_breaker_simple_force_penalties
+just video "$checkpoint" "$video" --seed 100 \
+    env.sim.physics.use_cuda_graph=true env.sim.physics.solver_cfg.iterations=50 \
+    env.sim.physics.solver_cfg.ls_iterations=10 env.sim.physics.solver_cfg.ccd_iterations=30
 ```
