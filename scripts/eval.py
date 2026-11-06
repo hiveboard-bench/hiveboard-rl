@@ -62,6 +62,7 @@ sys.argv = [sys.argv[0], *hydra_args]
 
 env_cfg, agent_cfg = resolve_task_config(args.task, "rsl_rl_cfg_entry_point")
 pushing = env_cfg.task.asset.mode == "push"
+force_axis = env_cfg.rewards.pad_lateral.params.get("axis")
 rate_unit = "m_s" if pushing else "rad_s"
 env_cfg.scene.num_envs = min(args.num_envs, args.episodes)
 env_cfg.seed = args.seed
@@ -182,6 +183,8 @@ with launch_simulation(env_cfg, args):
         key: torch.zeros(n_envs, len(arm_ids), device=dev)
         for key in ("joint_err_sq", "joint_acc_sq", "joint_reversals", "prev_measured_v", "prev_v")
     }
+    if force_axis is not None:
+        stats["max_pad_off_axis"] = torch.zeros(n_envs, device=dev)
     stats |= {
         "t_success": torch.full((n_envs,), float("nan"), device=dev),
         "grasp_wrist": torch.full((n_envs,), float("nan"), device=dev),
@@ -282,6 +285,11 @@ with launch_simulation(env_cfg, args):
             stats["max_pad_lateral"] = torch.maximum(
                 stats["max_pad_lateral"], lateral.max(dim=-1).values
             )
+            if force_axis is not None:
+                stats["max_pad_off_axis"] = torch.maximum(
+                    stats["max_pad_off_axis"],
+                    mdp.pad_force(uenv, exclude_axis=force_axis).amax(dim=-1),
+                )
             stats["max_pad_force"] = torch.maximum(
                 stats["max_pad_force"], mdp.pad_force(uenv).max(dim=-1).values
             )
@@ -377,6 +385,8 @@ with launch_simulation(env_cfg, args):
                         "grasp_wrist_flexion": float(stats["grasp_wrist"][i]),
                     }
                 )
+                if force_axis is not None:
+                    episodes[-1]["max_pad_off_axis_n"] = float(stats["max_pad_off_axis"][i])
                 if args.save and (episodes[-1]["success"] or args.keep_failed):
                     n = int(step_count[i])
                     terms = uenv.termination_manager
@@ -536,6 +546,11 @@ summary = {
     },
     "per_episode": episodes,
 }
+if force_axis is not None:
+    summary["pad_off_axis_n_p50_p99"] = torch.quantile(
+        torch.tensor([e["max_pad_off_axis_n"] for e in episodes]), quantiles
+    ).tolist()
+    summary["pad_force_axis_in_mechanism_frame"] = force_axis
 if args.video:
     summary["video"] = {"dir": os.path.abspath(args.video), "env0_episodes": env0_episodes}
 output = args.output or os.path.join(
@@ -580,6 +595,9 @@ print(
     f"pad force    per-episode peak, median / p99: pinch {sq[0]:.0f} / {sq[1]:.0f} N"
     f" | lateral {lat[0]:.0f} / {lat[1]:.0f} N"
 )
+if force_axis is not None:
+    off = summary["pad_off_axis_n_p50_p99"]
+    print(f"off-axis     per-episode peak, median / p99: {off[0]:.0f} / {off[1]:.0f} N")
 print(
     f"rate         commanded {summary[f'mean_commanded_rate_{rate_unit}']:.2f}"
     f" {'m/s' if pushing else 'rad/s'}"
