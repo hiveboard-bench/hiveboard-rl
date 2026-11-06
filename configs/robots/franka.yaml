@@ -61,3 +61,25 @@ env:
   viewer: {origin_type: env, env_index: 0, eye: [0.85, -0.75, 0.85], lookat: [0.6, 0.0, 0.1]}
 agent:
   algorithm: {use_clipped_value_loss: false}
+tasks:
+  switch_circuit_breaker_simple:
+    env:
+      pinch_finger_pos: null
+      observations:
+        teacher: {lever_gripped: null}
+      terminations: {expert_mechanism_lag: null}
+      rewards:
+        reach_lever: {weight: 0.0}
+        pinch_lever: {weight: 0.0}
+        pad_lateral:
+          weight: -2.0
+          params: {axis: 2, soft_force: 35.0, hard_force: 150.0}
+        pad_force:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:pad_force_excess
+          weight: -0.002
+          params: {max_force: 150.0}
+    play:
+      viewer:
+        eye: [0.90, -0.55, 0.50]
+        lookat: [0.60, 0.00, 0.10]

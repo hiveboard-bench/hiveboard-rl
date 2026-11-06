@@ -116,3 +116,11 @@ bc:
   critic_epochs: 0
   init_std: 0.1
   action_history_noise: 0.5
+tasks:
+  switch_circuit_breaker_simple:
+    publication:
+      events:
+        dynamics:
+          params:
+            ranges: {armature: [0.001, 0.001]}
+      commands: {reference: {rate_range: [0.15, 0.15]}}
