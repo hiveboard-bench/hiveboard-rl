@@ -402,15 +402,27 @@ class mechanism_task_progress(ManagerTermBase):
         super().__init__(cfg, env)
         self.credited = torch.zeros(env.num_envs, device=env.device)
         self.completed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self.contacted = torch.zeros_like(self.completed)
         env.progress_term = self
 
     def reset(self, env_ids=None):
         ids = slice(None) if env_ids is None else env_ids
         self.credited[ids] = mechanism_progress(self._env)[ids]
         self.completed[ids] = _at_goal(self._env)[ids]
+        self.contacted[ids] = False
+        if self._env.cfg.task.asset.mode == "push":
+            term = self._env.expert_bank_term
+            step = term.bank._bank_step(term.index[ids], term.start_step[ids])
+            self.contacted[ids] = (
+                (term.start_step[ids] > 0) & term.bank.contacted[term.index[ids], step]
+            )
 
     def __call__(self, env, completion_bonus):
-        gripped = lever_gripped(env)
+        mode = env.cfg.task.asset.mode
+        gripped = lever_gripped(env) if mode == "grasp" else held(env)
+        if mode == "push":
+            self.contacted |= gripped
+            gripped = self.contacted
         progress = torch.maximum(self.credited, mechanism_progress(env))
         credited = torch.where(gripped, progress, self.credited)
         done = gripped & _at_goal(env) & ~self.completed
@@ -423,8 +435,12 @@ class mechanism_task_progress(ManagerTermBase):
 def credited_progress(env):
     term = getattr(env, "progress_term", None)
     if term is None:
-        return torch.zeros(env.num_envs, 2, device=env.device)
-    return torch.stack((term.credited, term.completed.float()), dim=-1)
+        width = 3 if env.cfg.task.asset.mode == "push" else 2
+        return torch.zeros(env.num_envs, width, device=env.device)
+    state = (term.credited, term.completed.float())
+    if env.cfg.task.asset.mode == "push":
+        state += (term.contacted.float(),)
+    return torch.stack(state, dim=-1)
 
 
 def released_and_clear(env, min_distance=0.06, max_force=1.0):
@@ -487,6 +503,10 @@ class ReferenceCommand(CommandTerm):
         self.engaged_time[env_ids] = 0.0
 
     def _update_command(self):
+        if self._env.cfg.task.asset.mode == "push":
+            term = self._env.expert_bank_term
+            self.ref_angle[:] = term.bank.mechanism_reference(term.index, reference_step(self._env))
+            return
         self.engaged |= held(self._env)
         self.engaged_time += self._env.step_dt * self.engaged.float()
         moving = self.engaged_time > self.cfg.engage_delay_s
@@ -590,6 +610,7 @@ class ExpertBank:
         self.gripper_q = bank["gripper_q"].float()
         self.gripper_closed = bank["gripper_cmd"] < 0
         self.contact = (bank["pad_force"].float() > CONTACT_FORCE_N).float()
+        self.contacted = self.contact.any(dim=-1).cummax(dim=1).values
         self.gripper_joint_pos = bank["gripper_joint_pos"].float()
         self.dt = float(meta["dt"])
         self.idle_shift = grasp - self.grasp_step
@@ -803,8 +824,13 @@ def track_expert_mechanism(env, std, gate_on_grip=False):
         return reward
     term = env.expert_bank_term
     step = term.bank._bank_step(term.index, reference_step(env))
-    expert_grips = term.bank.contact[term.index, step].min(dim=-1).values > 0
-    return torch.where(expert_grips & ~lever_gripped(env), torch.zeros_like(reward), reward)
+    contact = term.bank.contact[term.index, step] > 0
+    if env.cfg.task.asset.mode == "push":
+        expert_grips, gripped = contact.any(dim=-1), held(env)
+    else:
+        expert_grips = contact.all(dim=-1)
+        gripped = lever_gripped(env) if env.cfg.task.asset.mode == "grasp" else held(env)
+    return torch.where(expert_grips & ~gripped, torch.zeros_like(reward), reward)
 
 
 def expert_gripper_reference(env, follow_release, follow_reach):
@@ -1084,11 +1110,18 @@ def bank_path(robot, task):
     return os.path.join(REPO_ROOT, "logs", "expert_bank", f"{robot}_{task}.pt")
 
 
+def config_layers(robot, task):
+    common, robot = load("train"), load(f"robots/{robot}")
+    return (
+        common, robot, common.get("tasks", {}).get(task, {}), robot.get("tasks", {}).get(task, {})
+    )
+
+
 def compose(robot_name, task_name, mode):
-    robot = load(f"robots/{robot_name}")
-    layers = (load("train"), robot)
+    layers = config_layers(robot_name, task_name)
+    robot = layers[1]
     cfg = board.build(EnvCfg(), robot_name, task_name)
-    for layer in layers:
+    for layer in layers[:2]:
         merge(cfg, layer.get("env", {}))
     asset = cfg.task.asset
     merge(cfg.viewer, {"asset_name": asset.name, **asset.viewer})
@@ -1127,6 +1160,8 @@ def compose(robot_name, task_name, mode):
     cfg.scene.robot = delayed_actuators(
         cfg.scene.robot, robot["delayed_groups"], robot["delay_s"], cfg.sim.dt
     )
+    for layer in layers[2:]:
+        merge(cfg, layer.get("env", {}))
     for layer in layers:
         merge(cfg, layer.get(mode, {}))
     return cfg
@@ -1139,6 +1174,6 @@ def runner_cfg(robot, task):
         critic=RslRlMLPModelCfg(),
         algorithm=RslRlPpoAlgorithmCfg(),
     )
-    merge(cfg, load("train")["agent"])
-    merge(cfg, load(f"robots/{robot}").get("agent", {}))
+    for layer in config_layers(robot, task):
+        merge(cfg, layer.get("agent", {}))
     return cfg
