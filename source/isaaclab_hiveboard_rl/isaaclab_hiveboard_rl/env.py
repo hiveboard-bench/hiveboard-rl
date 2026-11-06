@@ -200,11 +200,17 @@ def mechanism_state(env):
     return torch.stack((mechanism_progress(env), mechanism_rate(env)), dim=-1)
 
 
-def pad_force(env, sensor_names=("finger_contact", "jaw_contact")):
+def pad_force(env, sensor_names=("finger_contact", "jaw_contact"), exclude_axis=None):
     forces = []
     for name in sensor_names:
         matrix = env.scene[name].data.force_matrix_w.torch.reshape(env.num_envs, -1, 3)
-        forces.append(torch.norm(matrix.sum(dim=1), dim=-1))
+        force = matrix.sum(dim=1)
+        if exclude_axis is not None:
+            force = math_utils.quat_apply_inverse(
+                mechanism_asset(env).data.root_quat_w.torch, force
+            )
+            force[:, exclude_axis] = 0.0
+        forces.append(torch.norm(force, dim=-1))
     return torch.stack(forces, dim=-1)
 
 
@@ -240,8 +246,8 @@ def lever_gripped_obs(env):
     return lever_gripped(env).float().unsqueeze(-1)
 
 
-def lateral_force_limit_cost(env, soft_force, hard_force):
-    lateral = pad_force_split(env)[1]
+def lateral_force_limit_cost(env, soft_force, hard_force, axis=None):
+    lateral = pad_force_split(env)[1] if axis is None else pad_force(env, exclude_axis=axis)
     scaled = ((lateral - soft_force) / (hard_force - soft_force)).clamp(min=0.0)
     return torch.where(scaled <= 1.0, scaled.square(), 2.0 * scaled - 1.0).sum(dim=-1)
 

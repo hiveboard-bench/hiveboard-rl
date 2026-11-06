@@ -71,11 +71,13 @@ tasks:
       rewards:
         reach_lever: {weight: 0.0}
         pinch_lever: {weight: 0.0}
-        pad_lateral: {weight: 0.0}
+        pad_lateral:
+          weight: -2.0
+          params: {axis: 2, soft_force: 35.0, hard_force: 150.0}
         pad_force:
           _target_: isaaclab.managers.RewardTermCfg
           func: isaaclab_hiveboard_rl.env:pad_force_excess
-          weight: -0.001
+          weight: -0.002
           params: {max_force: 150.0}
     play:
       viewer:
