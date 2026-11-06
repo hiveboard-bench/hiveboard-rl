@@ -61,6 +61,8 @@ if args.video or args.publication:
 sys.argv = [sys.argv[0], *hydra_args]
 
 env_cfg, agent_cfg = resolve_task_config(args.task, "rsl_rl_cfg_entry_point")
+pushing = env_cfg.task.asset.mode == "push"
+rate_unit = "m_s" if pushing else "rad_s"
 env_cfg.scene.num_envs = min(args.num_envs, args.episodes)
 env_cfg.seed = args.seed
 reset_cfg = env_cfg.events.reset_from_bank
@@ -71,7 +73,8 @@ if expert:
     reset_cfg.func = mdp.reset_from_expert_bank_in_order
     reset_cfg.params["seed"] = args.seed
 if args.publication:
-    mdp.merge(env_cfg, mdp.load("train")["publication"])
+    for layer in mdp.config_layers(env_cfg.robot.name, env_cfg.task.name):
+        mdp.merge(env_cfg, layer.get("publication", {}))
 if args.publication or (expert and args.save is None):
     for term in (env_cfg.events.arm_delay, env_cfg.events.target_delay):
         if term is not None:
@@ -248,7 +251,8 @@ with launch_simulation(env_cfg, args):
             stats["joint_steps"] += active[:, 0]
             measured_v = robot.data.joint_vel.torch[:, arm_ids]
             releasing = (
-                stats["success"] & (gripper_action.raw_actions[:, 0] > 0) & (step_count >= 2)
+                stats["success"] & (pushing | (gripper_action.raw_actions[:, 0] > 0))
+                & (step_count >= 2)
             )
             stats["release_steps"] += releasing.float()
             stats["release_peak_speed"] = torch.maximum(
@@ -342,7 +346,7 @@ with launch_simulation(env_cfg, args):
                         "max_pad_lateral_n": float(stats["max_pad_lateral"][i]),
                         "max_mechanism_rate_rad_s": float(stats["max_mechanism_rate"][i]),
                         "max_tcp_speed_m_s": float(stats["max_tcp_speed"][i]),
-                        "commanded_rate_rad_s": float(stats["commanded_rate"][i]),
+                        f"commanded_rate_{rate_unit}": float(stats["commanded_rate"][i]),
                         "achieved_rate_rad_s": float(
                             stats["turn_rate_sum"][i] / stats["turn_steps"][i]
                         )
@@ -473,6 +477,7 @@ quantiles = torch.tensor((0.5, 0.99))
 summary = {
     "task": args.task,
     "robot": profile.name,
+    "interaction_mode": env_cfg.task.asset.mode,
     "diagnostic_joint": profile.diagnostic_joint,
     "agent": "rsl_rl_cfg_entry_point",
     "checkpoint": os.path.abspath(source),
@@ -507,7 +512,9 @@ summary = {
     ).tolist(),
     "mean_peak_mechanism_rate_rad_s": sum(e["max_mechanism_rate_rad_s"] for e in episodes) / n,
     "mean_peak_tcp_speed_m_s": sum(e["max_tcp_speed_m_s"] for e in episodes) / n,
-    "mean_commanded_rate_rad_s": sum(e["commanded_rate_rad_s"] for e in episodes) / n,
+    f"mean_commanded_rate_{rate_unit}": sum(
+        e[f"commanded_rate_{rate_unit}"] for e in episodes
+    ) / n,
     "mean_achieved_rate_rad_s": nanmean([e["achieved_rate_rad_s"] for e in episodes]),
     "invalid_episodes": sum(e["invalid"] for e in episodes),
     "collision_episodes": sum(e["collided"] for e in episodes),
@@ -552,17 +559,19 @@ sq, lat = summary["pad_squeeze_n_p50_p99"], summary["pad_lateral_n_p50_p99"]
 print(f"\n=== {args.task} | {os.path.basename(source)} ===")
 print(f"success      {successes}/{n} = {successes / n:.1%}  (95% Wilson [{lo:.1%}, {hi:.1%}])")
 print(f"reliability  >= {reliability:.1%} at 95% confidence (Clopper-Pearson)")
-print(f"time         {t_mean:.2f} +/- {t_std:.2f} s to open")
+print(f"time         {t_mean:.2f} +/- {t_std:.2f} s to goal")
 print(
-    f"stages       reached {stages['reached']:.1%} | grasped {stages['grasped']:.1%}"
-    f" | opened held {stages['opened_held']:.1%} (any means {stages['opened_any']:.1%})"
-    f" | released & clear at end {stages['released_clear_at_end']:.1%}"
+    f"stages       reached {stages['reached']:.1%}"
+    f" | {'contacted' if pushing else 'grasped'} {stages['grasped']:.1%}"
+    f" | goal credited {stages['opened_held']:.1%} (any means {stages['opened_any']:.1%})"
+    f" | clear at end {stages['released_clear_at_end']:.1%}"
 )
-print(f"complete     {stages['complete']:.1%} (opened while held, then released and clear)")
-print(
-    f"pinch        pinched {stages['pinched']:.1%} | opened while pinching"
-    f" {stages['opened_pinched']:.1%} | mean {summary['mean_pinch_s']:.2f} s pinched"
-)
+print(f"complete     {stages['complete']:.1%} (goal credited, then clear at the end)")
+if not pushing:
+    print(
+        f"pinch        pinched {stages['pinched']:.1%} | opened while pinching"
+        f" {stages['opened_pinched']:.1%} | mean {summary['mean_pinch_s']:.2f} s pinched"
+    )
 print(
     f"progress     mean max {summary['mean_max_progress']:.3f}"
     f" | peak pad force {summary['max_pad_force_n']:.1f} N"
@@ -572,7 +581,8 @@ print(
     f" | lateral {lat[0]:.0f} / {lat[1]:.0f} N"
 )
 print(
-    f"turn rate    commanded {summary['mean_commanded_rate_rad_s']:.2f} rad/s"
+    f"rate         commanded {summary[f'mean_commanded_rate_{rate_unit}']:.2f}"
+    f" {'m/s' if pushing else 'rad/s'}"
     f" | achieved {summary['mean_achieved_rate_rad_s']:.2f} rad/s (mean while held, 5-95% open)"
 )
 print(
