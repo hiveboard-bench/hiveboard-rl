@@ -129,3 +129,14 @@ just eval <checkpoint.pt> --episodes 300 --num_envs 100 --seed 100 \
 
 Select checkpoints by held-out complete rate: a credited switch followed by withdrawal, with the
 toggle still at its goal. The training uploader's best-return checkpoint is a different metric.
+
+## Franka small valve
+
+See the [task documentation](docs/franka/open_small_valve_simple/README.md) for the policy video,
+reward details, evaluation results and `just` commands.
+
+`open_small_valve_simple` pinches the wheel, turns it open, releases and withdraws.
+PPO fine-tunes a grasping checkpoint with binary gripper-command matching, bilateral pinch
+rewards and penalties for ungripped turning, excessive pad forces and net pulling, pushing
+and sideways loads. The documented checkpoint completed 296/300 held-out episodes (98.7%),
+with a bilateral pinch in all 300. Force thresholds are soft; rare high-force impacts remain.
