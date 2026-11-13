@@ -232,6 +232,22 @@ def pad_pinch_force(env):
     return -pad_force_split(env)[0]
 
 
+def mechanism_contact_force(env):
+    left, right = (
+        env.scene[name].data.force_matrix_w.torch.reshape(env.num_envs, -1, 3).sum(dim=1)
+        for name in ("finger_contact", "jaw_contact")
+    )
+    return math_utils.quat_apply_inverse(
+        env.scene["target_frame"].data.source_quat_w.torch, -left - right
+    )
+
+
+def mechanism_force_excess(env, max_force, axial=0):
+    force = mechanism_contact_force(env)
+    force = (axial * force[:, 2]).clamp(min=0.0) if axial else force[:, :2].norm(dim=-1)
+    return (force - max_force).clamp(min=0.0).square()
+
+
 def lever_gripped(env):
     gripped = (pad_pinch_force(env) >= PINCH_FORCE_N).all(dim=-1) & _gripper_closed(env).bool()
     if env.cfg.pinch_finger_pos is not None:
@@ -449,7 +465,7 @@ def credited_progress(env):
     return torch.stack(state, dim=-1)
 
 
-def released_and_clear(env, min_distance=0.06, max_force=1.0):
+def released_and_clear(env, min_distance=0.06, max_force=1.0, require_credit=False):
     dist, _ = tcp_grasp_error(env)
     if env.cfg.task.asset.mode == "push":
         let_go = torch.ones_like(dist, dtype=torch.bool)
@@ -457,6 +473,7 @@ def released_and_clear(env, min_distance=0.06, max_force=1.0):
         let_go = _gripper_closed(env) == 0.0
     return (
         succeeded(env)
+        & (env.progress_term.completed if require_credit else True)
         & let_go
         & (pad_force(env).max(dim=-1).values < max_force)
         & (dist >= min_distance)
@@ -509,7 +526,8 @@ class ReferenceCommand(CommandTerm):
         self.engaged_time[env_ids] = 0.0
 
     def _update_command(self):
-        if self._env.cfg.task.asset.mode == "push":
+        asset = self._env.cfg.task.asset
+        if asset.mode == "push" or asset.method == "wheel_turn":
             term = self._env.expert_bank_term
             self.ref_angle[:] = term.bank.mechanism_reference(term.index, reference_step(self._env))
             return
@@ -871,13 +889,24 @@ def _expert_closed(env):
     return term.bank.gripper_closed_reference(term.index, reference_step(env))
 
 
-def reach_while_expert_grips(env, std):
-    reach = 1.0 - torch.tanh(tcp_grasp_error(env)[0] / std)
+def track_expert_gripper_command(env):
+    return (_gripper_closed(env).bool() == _expert_closed(env)).float()
+
+
+def reach_while_expert_grips(env, std, rot_std=None):
+    dist, angle = tcp_grasp_error(env)
+    reach = 1.0 - torch.tanh(dist / std)
+    if rot_std is not None:
+        reach *= torch.exp(-angle.square() / rot_std**2)
     return reach * _expert_closed(env).float()
 
 
 def pinch_while_expert_grips(env):
     return (lever_gripped(env) & _expert_closed(env)).float()
+
+
+def turn_without_pinch_cost(env, min_rate):
+    return (mechanism_rate(env).abs() - min_rate).clamp(min=0.0) * ~lever_gripped(env)
 
 
 def expert_joint_drift(env, max_error):

@@ -62,6 +62,54 @@ env:
 agent:
   algorithm: {use_clipped_value_loss: false}
 tasks:
+  open_small_valve_simple:
+    env:
+      observations:
+        teacher:
+          expert_gripper: {params: {follow_reach: true, follow_release: true}}
+      rewards:
+        reach_lever: {params: {std: 0.03, rot_std: 0.35}}
+        track_expert_gripper: {weight: 2.0, params: {std: 0.005}}
+        track_gripper_command:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:track_expert_gripper_command
+          weight: 10.0
+        pinch_lever: {weight: 10.0}
+        turn_without_pinch:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:turn_without_pinch_cost
+          weight: -10.0
+          params: {min_rate: 0.03}
+        pad_lateral: {weight: -5.0, params: {soft_force: 25.0, hard_force: 100.0}}
+        pad_force:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:pad_force_excess
+          weight: -0.005
+          params: {max_force: 100.0}
+        mechanism_pull:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:mechanism_force_excess
+          weight: -0.01
+          params: {max_force: 10.0, axial: 1}
+        mechanism_push:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:mechanism_force_excess
+          weight: -0.005
+          params: {max_force: 15.0, axial: -1}
+        mechanism_lateral:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:mechanism_force_excess
+          weight: -0.005
+          params: {max_force: 20.0}
+        release_clear:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:released_and_clear
+          weight: 3.0
+          params: {require_credit: true}
+    play:
+      viewer:
+        eye: [0.90, -0.55, 0.50]
+        lookat: [0.60, 0.00, 0.10]
   switch_circuit_breaker_simple:
     env:
       pinch_finger_pos: null
