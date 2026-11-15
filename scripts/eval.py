@@ -4,13 +4,13 @@ import json
 import math
 import os
 import sys
+from contextlib import ExitStack
 
 import gymnasium as gym
 import torch
 from isaaclab_hiveboard_rl import env as mdp
 
 from isaaclab.app import add_launcher_args, launch_simulation
-from isaaclab.envs.utils import video_recorder
 from isaaclab.envs.utils.video_recorder_cfg import VideoRecorderCfg
 
 from isaaclab_rl.rsl_rl import (
@@ -64,6 +64,9 @@ env_cfg, agent_cfg = resolve_task_config(args.task, "rsl_rl_cfg_entry_point")
 pushing = env_cfg.task.asset.mode == "push"
 force_axis = env_cfg.rewards.pad_lateral.params.get("axis")
 measure_load = getattr(env_cfg.rewards, "mechanism_pull", None) is not None
+if measure_load:
+    load_axis = env_cfg.rewards.mechanism_pull.params.get("axis", 2)
+    side_axes = [i for i in range(3) if i != load_axis]
 rate_unit = "m_s" if pushing else "rad_s"
 env_cfg.scene.num_envs = min(args.num_envs, args.episodes)
 env_cfg.seed = args.seed
@@ -97,6 +100,7 @@ if args.video:
     ]
 if args.publication:
     from isaaclab_visualizers.newton import NewtonRTXVisualizerCfg
+    from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
 
     env_cfg.viewer.resolution = (1920, 1080)
     env_cfg.sim.visualizer_cfgs = [
@@ -117,13 +121,6 @@ if args.publication:
         )
     ]
 
-    class PublicationClip(video_recorder.ImageSequenceClip):
-        def write_videofile(self, filename, **kwargs):
-            kwargs.update(fps=50, preset="slow", ffmpeg_params=["-crf", "12"])
-            super().write_videofile(filename, **kwargs)
-
-    video_recorder.ImageSequenceClip = PublicationClip
-
 with launch_simulation(env_cfg, args):
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, check_rsl_rl_version())
     clip_actions = None if expert else agent_cfg.clip_actions
@@ -139,6 +136,9 @@ with launch_simulation(env_cfg, args):
         policy = runner.get_inference_policy(device=uenv.device)
 
     n_envs, dev, dt = uenv.num_envs, uenv.device, uenv.step_dt
+    load_sensor = None
+    if measure_load:
+        load_sensor = uenv.reward_manager.get_term_cfg("mechanism_pull").params.get("sensor_cfg")
     turn = uenv.command_manager.get_term("reference")
     robot = uenv.scene["robot"]
     profile = uenv.cfg.robot
@@ -216,7 +216,15 @@ with launch_simulation(env_cfg, args):
             "rewards": torch.zeros(n_envs, horizon, device=dev),
         }
         demos = []
-    with torch.inference_mode():
+    with torch.inference_mode(), ExitStack() as stack:
+        if args.publication:
+            recorder = uenv.video_recorders[0]
+            os.makedirs(recorder.cfg.output_dir, exist_ok=True)
+            writer = stack.enter_context(FFMPEG_VideoWriter(
+                recorder._clip_path(recorder._clip_index), env_cfg.viewer.resolution,
+                fps=1.0 / uenv.step_dt, preset="slow",
+                ffmpeg_params=["-crf", "12", "-r", "50"],
+            ))
         while len(episodes) < args.episodes:
             dist, ang = mdp.tcp_grasp_error(uenv)
             progress = mdp.mechanism_progress(uenv)
@@ -297,15 +305,15 @@ with launch_simulation(env_cfg, args):
                     mdp.pad_force(uenv, exclude_axis=force_axis).amax(dim=-1),
                 )
             if measure_load:
-                force = mdp.mechanism_contact_force(uenv)
+                force = mdp.mechanism_contact_force(uenv, load_sensor)
                 stats["max_mechanism_pull"] = torch.maximum(
-                    stats["max_mechanism_pull"], force[:, 2].clamp(min=0.0)
+                    stats["max_mechanism_pull"], force[:, load_axis].clamp(min=0.0)
                 )
                 stats["max_mechanism_push"] = torch.maximum(
-                    stats["max_mechanism_push"], (-force[:, 2]).clamp(min=0.0)
+                    stats["max_mechanism_push"], (-force[:, load_axis]).clamp(min=0.0)
                 )
                 stats["max_mechanism_lateral"] = torch.maximum(
-                    stats["max_mechanism_lateral"], force[:, :2].norm(dim=-1)
+                    stats["max_mechanism_lateral"], force[:, side_axes].norm(dim=-1)
                 )
             stats["max_pad_force"] = torch.maximum(
                 stats["max_pad_force"], mdp.pad_force(uenv).max(dim=-1).values
@@ -325,6 +333,10 @@ with launch_simulation(env_cfg, args):
                 buffers["teacher"][rows, step_count] = obs["teacher"]
                 buffers["actions"][rows, step_count] = action
             obs, reward, dones, _ = env.step(action)
+            if args.publication:
+                frame = recorder._frames.pop()
+                if not dones[0]:
+                    writer.write_frame(frame)
             if args.save:
                 buffers["rewards"][rows, step_count] = reward
             if not expert:
@@ -426,7 +438,7 @@ with launch_simulation(env_cfg, args):
                 stats["prev_q"][i] = robot.data.joint_pos.torch[i, arm_ids]
                 step_count[i] = 0
     if args.publication:
-        uenv.video_recorders[0]._frames.pop()
+        print(f"[VIDEO] {writer.filename}")
     bank_path = bank_term.cfg.params["path"]
     env.close()
 
