@@ -141,6 +141,35 @@ with launch_simulation(env_cfg, args):
         )
     }
     stats["wall_s"] = 0.0
+
+    def save_bank(path):
+        bank = {key: torch.cat(values)[: args.num_trajectories] for key, values in kept.items()}
+        bank["meta"] = {
+            "robot": profile.name,
+            "task": args.task,
+            "diagnostic_joint": profile.diagnostic_joint,
+            "physics_dt": env.physics_dt,
+            "physics_cfg": env_cfg.sim.physics.to_dict(),
+            "seed": args.seed,
+            "num_envs": n_envs,
+            "plan_batch_size": min(args.num_envs, args.plan_batch_size or args.num_envs),
+            "task_cfg": env_cfg.task.to_dict(),
+            "method": env_cfg.task.asset.method,
+            "dt": env.step_dt,
+            "horizon": horizon,
+            "arm_joint_names": arm,
+            "gripper_joint_names": list(hand_names),
+            "phases": list(PHASES),
+            "dynamics": list(mdp.board.DYNAMICS),
+            "expert_diversity": list(mdp.board.EXPERT_DIVERSITY),
+            "expert_success": stats["successes"] / stats["episodes"],
+            "stats": stats,
+            "sampled": {key: torch.cat(values) for key, values in sampled.items()},
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        torch.save(bank, path)
+        return bank
+
     for wave in range(args.max_waves):
         t0 = time.perf_counter()
         env.reset()
@@ -294,6 +323,7 @@ with launch_simulation(env_cfg, args):
         sampled["ok"].append(ok.cpu())
         sampled["progress"].append(best_progress.cpu())
         sampled["grasp_in_frame"].append(grasp_in_frame.cpu())
+        save_bank(output + ".partial")
         print(
             f"[BANK] wave {wave}: {counts['opened_held']}/{n_envs} opened while held, "
             f"{counts['fallback']} discarded for a fallback, "
@@ -306,30 +336,8 @@ with launch_simulation(env_cfg, args):
     n = stats["episodes"]
     rate = stats["successes"] / n
     assert stats["kept"] > 0, "no successful expert trajectories"
-    bank = {key: torch.cat(values)[: args.num_trajectories] for key, values in kept.items()}
-    bank["meta"] = {
-        "robot": profile.name,
-        "task": args.task,
-        "diagnostic_joint": profile.diagnostic_joint,
-        "physics_dt": env.physics_dt,
-        "seed": args.seed,
-        "num_envs": n_envs,
-        "plan_batch_size": min(args.num_envs, args.plan_batch_size or args.num_envs),
-        "task_cfg": env_cfg.task.to_dict(),
-        "method": env_cfg.task.asset.method,
-        "dt": env.step_dt,
-        "horizon": horizon,
-        "arm_joint_names": arm,
-        "gripper_joint_names": list(hand_names),
-        "phases": list(PHASES),
-        "dynamics": list(mdp.board.DYNAMICS),
-        "expert_diversity": list(mdp.board.EXPERT_DIVERSITY),
-        "expert_success": rate,
-        "stats": stats,
-        "sampled": {key: torch.cat(values) for key, values in sampled.items()},
-    }
-    os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
-    torch.save(bank, output)
+    bank = save_bank(output)
+    os.remove(output + ".partial")
     print(
         f"[BANK] saved {len(bank['arm_q'])} trajectories to {output}\n"
         f"[BANK] expert success {stats['successes']}/{n} = {rate:.1%}, "
