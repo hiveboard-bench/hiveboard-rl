@@ -140,3 +140,12 @@ PPO fine-tunes a grasping checkpoint with binary gripper-command matching, bilat
 rewards and penalties for ungripped turning, excessive pad forces and net pulling, pushing
 and sideways loads. The documented checkpoint completed 296/300 held-out episodes (98.7%),
 with a bilateral pinch in all 300. Force thresholds are soft; rare high-force impacts remain.
+
+## Franka lamp
+
+See the [task documentation](docs/franka/tighten_lamp_simple/README.md) for the rollout,
+rewards, evaluation results and `just` commands.
+
+`tighten_lamp_simple` learns repeated pinch, screw and regrasp cycles with coupled axial motion.
+The checkpoint reaches the goal while held in 254/300 held-out episodes (84.7%); 33/300 (11.0%)
+also finish released and clear. Completion, contact forces and collisions need further work.
