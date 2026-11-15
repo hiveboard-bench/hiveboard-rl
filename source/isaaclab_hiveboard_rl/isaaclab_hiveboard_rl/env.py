@@ -232,19 +232,25 @@ def pad_pinch_force(env):
     return -pad_force_split(env)[0]
 
 
-def mechanism_contact_force(env):
+def mechanism_contact_force(env, sensor_cfg=None):
     left, right = (
         env.scene[name].data.force_matrix_w.torch.reshape(env.num_envs, -1, 3).sum(dim=1)
         for name in ("finger_contact", "jaw_contact")
     )
+    force = -left - right
+    if sensor_cfg is not None:
+        force -= env.scene[sensor_cfg.name].data.net_forces_w.torch[:, sensor_cfg.body_ids].sum(1)
     return math_utils.quat_apply_inverse(
-        env.scene["target_frame"].data.source_quat_w.torch, -left - right
+        env.scene["target_frame"].data.source_quat_w.torch, force
     )
 
 
-def mechanism_force_excess(env, max_force, axial=0):
-    force = mechanism_contact_force(env)
-    force = (axial * force[:, 2]).clamp(min=0.0) if axial else force[:, :2].norm(dim=-1)
+def mechanism_force_excess(env, max_force, axial=0, axis=2, sensor_cfg=None):
+    force = mechanism_contact_force(env, sensor_cfg)
+    force = (
+        (axial * force[:, axis]).clamp(min=0.0) if axial
+        else force[:, [j for j in range(3) if j != axis]].norm(dim=-1)
+    )
     return (force - max_force).clamp(min=0.0).square()
 
 
@@ -439,9 +445,9 @@ class mechanism_task_progress(ManagerTermBase):
                 (term.start_step[ids] > 0) & term.bank.contacted[term.index[ids], step]
             )
 
-    def __call__(self, env, completion_bonus):
+    def __call__(self, env, completion_bonus, require_pinch=False):
         mode = env.cfg.task.asset.mode
-        gripped = lever_gripped(env) if mode == "grasp" else held(env)
+        gripped = lever_gripped(env) if mode == "grasp" or require_pinch else held(env)
         if mode == "push":
             self.contacted |= gripped
             gripped = self.contacted
@@ -524,10 +530,23 @@ class ReferenceCommand(CommandTerm):
         self.ref_angle[env_ids] = mechanism_position(self._env)[env_ids]
         self.engaged[env_ids] = False
         self.engaged_time[env_ids] = 0.0
+        if self._env.cfg.task.asset.pitch is not None:
+            self._update_screw_target()
+
+    def _update_screw_target(self):
+        asset = self._env.cfg.task.asset
+        mechanism = mechanism_asset(self._env)
+        axial = asset.axial_reference + asset.pitch / math.tau * mechanism_position(self._env)
+        mechanism.set_joint_position_target(
+            axial.clamp(min=0.0, max=asset.upper_limit)[:, None],
+            joint_ids=mechanism.find_joints("PrismaticJoint")[0],
+        )
 
     def _update_command(self):
         asset = self._env.cfg.task.asset
-        if asset.mode == "push" or asset.method == "wheel_turn":
+        if asset.pitch is not None:
+            self._update_screw_target()
+        if asset.mode == "push" or asset.method in ("wheel_turn", "screw_regrasp"):
             term = self._env.expert_bank_term
             self.ref_angle[:] = term.bank.mechanism_reference(term.index, reference_step(self._env))
             return

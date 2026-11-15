@@ -62,6 +62,78 @@ env:
 agent:
   algorithm: {use_clipped_value_loss: false}
 tasks:
+  tighten_lamp_simple:
+    env:
+      terminations:
+        arm_collision:
+          params:
+            sensor_cfg:
+              _target_: isaaclab.managers.SceneEntityCfg
+              name: arm_contact
+              body_names: ["fr3_link[1-7]"]
+      observations:
+        teacher:
+          expert_gripper: {params: {follow_reach: true, follow_release: true}}
+      rewards:
+        reach_lever: {params: {std: 0.03}}
+        track_expert_gripper: {weight: 3.0, params: {std: 0.004}}
+        track_gripper_command:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:track_expert_gripper_command
+          weight: 10.0
+        pinch_lever: {weight: 10.0}
+        task_progress: {weight: 20.0, params: {require_pinch: true}}
+        turn_without_pinch:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:turn_without_pinch_cost
+          weight: -10.0
+          params: {min_rate: 0.05}
+        pad_lateral: {weight: -2.0, params: {soft_force: 35.0, hard_force: 150.0}}
+        pad_force:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:pad_force_excess
+          weight: -0.002
+          params: {max_force: 100.0}
+        palm_force:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab.envs.mdp:contact_forces
+          weight: -0.1
+          params:
+            threshold: 25.0
+            sensor_cfg: &lamp_palm
+              _target_: isaaclab.managers.SceneEntityCfg
+              name: arm_contact
+              body_names: [fr3_hand]
+        mechanism_pull:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:mechanism_force_excess
+          weight: -0.005
+          params: {max_force: 15.0, axial: 1, axis: 0, sensor_cfg: *lamp_palm}
+        mechanism_push:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:mechanism_force_excess
+          weight: -0.0025
+          params: {max_force: 25.0, axial: -1, axis: 0, sensor_cfg: *lamp_palm}
+        mechanism_lateral:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:mechanism_force_excess
+          weight: -0.0025
+          params: {max_force: 25.0, axis: 0, sensor_cfg: *lamp_palm}
+        release_clear:
+          _target_: isaaclab.managers.RewardTermCfg
+          func: isaaclab_hiveboard_rl.env:released_and_clear
+          weight: 3.0
+          params: {require_credit: true}
+    expert:
+      sim:
+        physics:
+          newton_mjwarp:
+            use_cuda_graph: true
+            solver_cfg: {iterations: 50, ls_iterations: 10, ccd_iterations: 30}
+    play:
+      viewer:
+        eye: [0.90, -0.55, 0.55]
+        lookat: [0.60, 0.00, 0.12]
   open_small_valve_simple:
     env:
       observations:
