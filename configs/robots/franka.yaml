@@ -77,8 +77,8 @@ tasks:
         pad_force:
           _target_: isaaclab.managers.RewardTermCfg
           func: isaaclab_hiveboard_rl.env:pad_force_excess
-          weight: -0.002
-          params: {max_force: 150.0}
+          weight: -0.005
+          params: {max_force: 80.0}
     play:
       viewer:
         eye: [0.90, -0.55, 0.50]
