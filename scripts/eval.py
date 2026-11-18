@@ -63,6 +63,7 @@ sys.argv = [sys.argv[0], *hydra_args]
 env_cfg, agent_cfg = resolve_task_config(args.task, "rsl_rl_cfg_entry_point")
 pushing = env_cfg.task.asset.mode == "push"
 force_axis = env_cfg.rewards.pad_lateral.params.get("axis")
+measure_load = getattr(env_cfg.rewards, "mechanism_pull", None) is not None
 rate_unit = "m_s" if pushing else "rad_s"
 env_cfg.scene.num_envs = min(args.num_envs, args.episodes)
 env_cfg.seed = args.seed
@@ -185,6 +186,11 @@ with launch_simulation(env_cfg, args):
     }
     if force_axis is not None:
         stats["max_pad_off_axis"] = torch.zeros(n_envs, device=dev)
+    if measure_load:
+        stats |= {
+            key: torch.zeros(n_envs, device=dev)
+            for key in ("max_mechanism_pull", "max_mechanism_push", "max_mechanism_lateral")
+        }
     stats |= {
         "t_success": torch.full((n_envs,), float("nan"), device=dev),
         "grasp_wrist": torch.full((n_envs,), float("nan"), device=dev),
@@ -290,6 +296,17 @@ with launch_simulation(env_cfg, args):
                     stats["max_pad_off_axis"],
                     mdp.pad_force(uenv, exclude_axis=force_axis).amax(dim=-1),
                 )
+            if measure_load:
+                force = mdp.mechanism_contact_force(uenv)
+                stats["max_mechanism_pull"] = torch.maximum(
+                    stats["max_mechanism_pull"], force[:, 2].clamp(min=0.0)
+                )
+                stats["max_mechanism_push"] = torch.maximum(
+                    stats["max_mechanism_push"], (-force[:, 2]).clamp(min=0.0)
+                )
+                stats["max_mechanism_lateral"] = torch.maximum(
+                    stats["max_mechanism_lateral"], force[:, :2].norm(dim=-1)
+                )
             stats["max_pad_force"] = torch.maximum(
                 stats["max_pad_force"], mdp.pad_force(uenv).max(dim=-1).values
             )
@@ -387,6 +404,9 @@ with launch_simulation(env_cfg, args):
                 )
                 if force_axis is not None:
                     episodes[-1]["max_pad_off_axis_n"] = float(stats["max_pad_off_axis"][i])
+                if measure_load:
+                    for name in ("mechanism_pull", "mechanism_push", "mechanism_lateral"):
+                        episodes[-1][f"max_{name}_n"] = float(stats[f"max_{name}"][i])
                 if args.save and (episodes[-1]["success"] or args.keep_failed):
                     n = int(step_count[i])
                     terms = uenv.termination_manager
@@ -551,6 +571,11 @@ if force_axis is not None:
         torch.tensor([e["max_pad_off_axis_n"] for e in episodes]), quantiles
     ).tolist()
     summary["pad_force_axis_in_mechanism_frame"] = force_axis
+if measure_load:
+    for name in ("mechanism_pull", "mechanism_push", "mechanism_lateral"):
+        summary[f"{name}_n_p50_p99"] = torch.quantile(
+            torch.tensor([e[f"max_{name}_n"] for e in episodes]), quantiles
+        ).tolist()
 if args.video:
     summary["video"] = {"dir": os.path.abspath(args.video), "env0_episodes": env0_episodes}
 output = args.output or os.path.join(
@@ -598,6 +623,15 @@ print(
 if force_axis is not None:
     off = summary["pad_off_axis_n_p50_p99"]
     print(f"off-axis     per-episode peak, median / p99: {off[0]:.0f} / {off[1]:.0f} N")
+if measure_load:
+    pull = summary["mechanism_pull_n_p50_p99"]
+    push = summary["mechanism_push_n_p50_p99"]
+    side = summary["mechanism_lateral_n_p50_p99"]
+    print(
+        f"net load     per-episode peak, median / p99: pull {pull[0]:.0f} / {pull[1]:.0f} N"
+        f" | push {push[0]:.0f} / {push[1]:.0f} N"
+        f" | lateral {side[0]:.0f} / {side[1]:.0f} N"
+    )
 print(
     f"rate         commanded {summary[f'mean_commanded_rate_{rate_unit}']:.2f}"
     f" {'m/s' if pushing else 'rad/s'}"
