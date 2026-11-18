@@ -88,8 +88,44 @@ Environments and support expansion can also be verified at
 
 ## Adding a task
 
-1. Generate its Newton USD with `just assets`.
-2. Add an `AssetCfg` and a `TaskCfg` in core `isaaclab_hiveboard/tasks_simple.py`.
-3. `just bank` checks expert success. Train only above the gate.
+1. For a new mechanism, generate its Newton USD with `just assets` and add its `AssetCfg` and
+   `TaskCfg` in core `isaaclab_hiveboard/tasks_simple.py`. Existing core tasks are registered already.
+2. Put learning overrides under `tasks.<task_name>` in `configs/train.yaml` or the robot YAML.
+   Each entry supports `env`, `agent`, `play`, `expert` and `publication`. Shared and robot defaults
+   are applied first, then shared task and robot task settings, then execution-mode settings.
+3. Collect a task-specific bank and replay it with `just eval <bank.pt> --policy expert` before
+   training. Use a separate collection seed for the held-out bank.
 
 It is expected that a new kind of motion adds one method to the core `expert()`.Then, assets with that motion ought to reuse it.
+
+## Franka circuit breaker
+
+See the [task documentation](docs/franka/switch_circuit_breaker_simple/README.md) for the video,
+reward details and evaluation results.
+
+`switch_circuit_breaker_simple` pushes the toggle from +30 to -30 degrees with closed fingers,
+then withdraws. It trains a separate policy with the same PPO architecture as the valve.
+Push progress requires pad contact during the episode, including contact before a bank mid-start.
+Progress and completion pay once, and can continue after contact ends. Mechanism reference positions
+come from the bank; the expert speed command is in m/s. Pinch and fixed-target reach rewards are
+disabled. Force costs penalize total pad force above 150 N and force perpendicular to the push axis
+above 35 N. The push axis follows mechanism-local Z (world X at the nominal Franka pose).
+Mechanism-lag termination is disabled to allow timing differences in the toggle transition.
+
+```bash
+export RL_ROBOT=franka RL_TASK=switch_circuit_breaker_simple
+heldout=logs/expert_bank/franka_switch_circuit_breaker_simple_heldout.pt
+just bank --num_trajectories 1000 --plan_batch_size 64
+just bank --num_trajectories 200 --plan_batch_size 64 --seed 10020 \
+    --output "$heldout"
+just train --num_envs 4096 --seed 0 --max_iterations 1000 \
+    env.sim.physics.use_cuda_graph=true env.sim.physics.solver_cfg.iterations=50 \
+    env.sim.physics.solver_cfg.ls_iterations=10 env.sim.physics.solver_cfg.ccd_iterations=30
+just eval <checkpoint.pt> --episodes 300 --num_envs 100 --seed 100 \
+    env.events.reset_from_bank.params.path="$heldout" \
+    env.sim.physics.use_cuda_graph=true env.sim.physics.solver_cfg.iterations=50 \
+    env.sim.physics.solver_cfg.ls_iterations=10 env.sim.physics.solver_cfg.ccd_iterations=30
+```
+
+Select checkpoints by held-out complete rate: a credited switch followed by withdrawal, with the
+toggle still at its goal. The training uploader's best-return checkpoint is a different metric.
