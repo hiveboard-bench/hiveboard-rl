@@ -63,7 +63,7 @@ sys.argv = [sys.argv[0], *hydra_args]
 env_cfg, agent_cfg = resolve_task_config(args.task, "rsl_rl_cfg_entry_point")
 pushing = env_cfg.task.asset.mode == "push"
 force_axis = env_cfg.rewards.pad_lateral.params.get("axis")
-measure_load = getattr(env_cfg.rewards, "mechanism_pull", None) is not None
+measure_load = not pushing
 rate_unit = "m_s" if pushing else "rad_s"
 env_cfg.scene.num_envs = min(args.num_envs, args.episodes)
 env_cfg.seed = args.seed
